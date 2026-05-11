@@ -35,3 +35,5 @@ ib_insync>=0.9.86
 # tavily-python>=0.3.0
 # SerpAPI - Google/Bing search scraper (free 100 requests/month)
 # google-search-results>=2.4.0
+# Smart Money Concepts (FVG, Order Block, BOS/CHoCH, swings) for /api/smc/analyze
+smartmoneyconcepts>=0.0.27
