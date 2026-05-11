@@ -74,38 +74,72 @@ python run.py
 
 The dev server starts on `http://localhost:5000` with auto-reload.
 
-## Frontend (private Vue repository)
+## Frontend Vue source — clone & sync workflow
 
-The open-source tree **does not** contain Vue source. Maintain the UI in your separate repo, then ship static files here:
+The open-source tree **does not** contain Vue source. The UI lives in
+[QuantDinger-Vue](https://github.com/brokermr810/QuantDinger-Vue). The recommended
+layout clones it inside this repo as `quantdinger_vue/` — already gitignored, so
+it stays out of the main repo's git index.
+
+```
+QuantDinger/
+├── backend_api_python/
+├── frontend/dist/        ← committed build artefact (what Docker copies)
+├── quantdinger_vue/      ← Vue source (gitignored)
+└── scripts/sync-frontend-dist.sh
+```
+
+### One-time setup
 
 ```bash
-# In your private Vue repo
-npm install
-npm run build
+cd /path/to/QuantDinger
+git clone https://github.com/brokermr810/QuantDinger-Vue.git quantdinger_vue
+( cd quantdinger_vue && npm install --legacy-peer-deps )
 ```
 
-Copy the build into this repository (replace the path with your clone):
+### Day-to-day: build + sync + rebuild container
 
 ```bash
-# Linux/macOS — helper script (requires QUANTDINGER_VUE_SRC)
-export QUANTDINGER_VUE_SRC=/path/to/private-vue-repo
-./scripts/build-frontend.sh
-
-# Or manual sync
-rsync -a --delete /path/to/private-vue-repo/dist/ frontend/dist/
+./scripts/sync-frontend-dist.sh
 ```
 
-```powershell
-# Windows (PowerShell)
-robocopy C:\path\to\private-vue-repo\dist frontend\dist /MIR
-```
+What it does:
+1. `npm install --legacy-peer-deps` + `npm run build` inside `quantdinger_vue/`
+2. Replaces `frontend/dist/` with the fresh build
+3. Runs `docker compose up -d --build frontend`
 
-Then rebuild or start the stack as usual:
+Useful flags:
+
+| Flag | Effect |
+|------|--------|
+| `--no-build`  | Skip npm; just sync an already-built `dist/` |
+| `--no-docker` | Skip the container rebuild |
+
+If you keep the Vue repo somewhere else, override the path:
 
 ```bash
-docker compose build frontend
-docker compose up -d frontend
+QUANTDINGER_VUE_SRC=~/work/QuantDinger-Vue ./scripts/sync-frontend-dist.sh
 ```
+
+### Hot-reload dev loop (no Docker rebuild per change)
+
+While iterating on Vue code, run the backend in Docker but the Vue dev server
+natively — far faster than rebuilding the nginx image each time:
+
+```bash
+# Terminal 1 — backend stack only
+docker compose up -d postgres redis backend
+
+# Terminal 2 — vue-cli dev server (proxies /api to localhost:5000)
+cd quantdinger_vue && npm run serve
+```
+
+Open <http://localhost:8000> (port + `/api` proxy are pre-configured in
+`quantdinger_vue/vue.config.js`). Only run `sync-frontend-dist.sh` when you
+want a production build inside the Docker container (for deploys or demos).
+
+> Legacy script `scripts/build-frontend.sh` still works and requires
+> `QUANTDINGER_VUE_SRC` to be set explicitly (no Docker rebuild step).
 
 ## Adding a New Data Source
 
