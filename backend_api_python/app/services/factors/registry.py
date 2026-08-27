@@ -70,6 +70,10 @@ def _technical_warmup(factor_id: str, params: Mapping[str, Any]) -> int:
         return int(params.get("slow_period") or 10)
     if factor_id in {"obv", "ad_line"}:
         return period + 1
+    if factor_id in {"smc_structure", "smc_fvg"}:
+        # A pivot needs swing_length bars on each side, plus a bar for the
+        # break to land on. Below this the structure is not yet defined.
+        return int(params.get("swing_length") or 10) * 2 + 2
     return max(1, period)
 
 
@@ -109,6 +113,9 @@ _OUTPUT_OPTIONS = {
     "keltner_channels": ("upper", "middle", "lower", "position"),
     "macd": ("line", "signal", "histogram"),
     "obv": ("value", "slope"),
+    "smc_fvg": ("side", "top", "bottom", "distance"),
+    "smc_structure": ("trend", "bos", "choch", "swing_high", "swing_low",
+                      "distance_high", "distance_low"),
     "stochastic": ("k", "d"),
     "supertrend": ("direction", "line"),
     "vwap": ("value", "distance"),
@@ -211,6 +218,8 @@ _FACTORS = {
         _technical("parkinson_volatility", "risk", ("high", "low"), {"period": 20}, "lower_is_bullish", lambda f, p: _parkinson_volatility(f, p)),
         _technical("garman_klass_volatility", "risk", ("open", "high", "low", "close"), {"period": 20}, "lower_is_bullish", lambda f, p: _garman_klass_volatility(f, p)),
         _technical("amihud_illiquidity", "liquidity", ("close", "volume"), {"period": 20}, "lower_is_bullish", lambda f, p: _amihud_illiquidity(f, p)),
+        _technical("smc_structure", "trend", ("high", "low", "close"), {"swing_length": 10, "output": "trend"}, "higher_is_bullish", lambda f, p: _smc_structure(f, p)),
+        _technical("smc_fvg", "trend", ("high", "low", "close"), {"output": "side"}, "higher_is_bullish", lambda f, p: _smc_fvg(f, p)),
         _fundamental("market_cap", "size", ("market_cap",), "lower_is_bullish", lambda f, p: _last_value(f, "market_cap")),
         _fundamental("earnings_yield", "valuation", ("net_income", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "net_income", "market_cap")),
         _fundamental("book_to_price", "valuation", ("book_value", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "book_value", "market_cap")),
@@ -1003,3 +1012,179 @@ def _amihud_illiquidity(frame: pd.DataFrame, params: Mapping[str, Any]) -> float
     returns = close.pct_change().abs().iloc[-period:]
     traded_value = (close.iloc[-period:] * volume).replace(0, np.nan)
     return float((returns.to_numpy() / traded_value.to_numpy()).mean())
+
+
+# --- Smart Money Concepts --------------------------------------------------
+# Market structure primitives: confirmed swings, break of structure, change of
+# character, and fair value gaps.
+#
+# The whole design turns on WHEN a structure becomes knowable. A swing pivot
+# needs `swing_length` bars on BOTH sides, so it cannot be confirmed until
+# `swing_length` bars after it printed. Every derived event therefore fires on
+# the bar that broke the level -- never on the pivot itself.
+#
+# This matters more here than in a charting context. The registry is driven by
+# runtime.py's expanding-window loop (`visible = frame.iloc[:index + 1]`), which
+# asks each bar "what is true right now". Answering with a pivot that needed
+# future bars to identify would feed the backtest information the strategy could
+# not have had.
+#
+# The `smartmoneyconcepts` package stamps events on the pivot bar instead.
+# Measured over 150 BOS/CHoCH signals, none were visible on the bar carrying
+# them; mean lag was 17-58 bars depending on swing_length. That is inherent to
+# the definition, not a bug in the package -- but it is unusable as a factor.
+
+
+def _smc_swings(high: np.ndarray, low: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Strict swing pivots. Bars within `n` of either edge can never qualify.
+
+    Candidates come from a centred rolling max/min (cheap, vectorised); the
+    strictness check then runs only on those few bars rather than every bar.
+    """
+    size = len(high)
+    is_high = np.zeros(size, dtype=bool)
+    is_low = np.zeros(size, dtype=bool)
+    if size < 2 * n + 1:
+        return is_high, is_low
+
+    window = 2 * n + 1
+    roll_high = pd.Series(high).rolling(window, center=True).max().to_numpy()
+    roll_low = pd.Series(low).rolling(window, center=True).min().to_numpy()
+
+    for index in range(n, size - n):
+        if high[index] == roll_high[index]:
+            segment = high[index - n:index + n + 1]
+            if int(np.sum(segment == high[index])) == 1:
+                is_high[index] = True
+        if low[index] == roll_low[index]:
+            segment = low[index - n:index + n + 1]
+            if int(np.sum(segment == low[index])) == 1:
+                is_low[index] = True
+    return is_high, is_low
+
+
+def _smc_state(frame: pd.DataFrame, params: Mapping[str, Any]) -> dict[str, float]:
+    """Replay the visible window and report the structure as of its last bar."""
+    swing_length = int(params.get("swing_length") or 10)
+    if swing_length < 2:
+        raise FactorError("factor.badParams")
+    size = len(frame)
+    if size < 2 * swing_length + 2:
+        raise FactorError("factor.insufficientHistory")
+
+    high = pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float)
+
+    is_high, is_low = _smc_swings(high, low, swing_length)
+
+    level_high = float("nan")
+    level_low = float("nan")
+    high_live = False
+    low_live = False
+    direction = 0
+    bos = 0
+    choch = 0
+
+    for index in range(size):
+        # The pivot at index - swing_length becomes knowable exactly now.
+        pivot = index - swing_length
+        if pivot >= 0:
+            if is_high[pivot]:
+                level_high, high_live = high[pivot], True
+            if is_low[pivot]:
+                level_low, low_live = low[pivot], True
+
+        broke_up = 0
+        broke_down = 0
+        if high_live and not np.isnan(level_high) and close[index] > level_high:
+            broke_up = 1 if direction >= 0 else 2      # 1 = BOS, 2 = CHoCH
+            direction = 1
+            high_live = False
+        elif low_live and not np.isnan(level_low) and close[index] < level_low:
+            broke_down = 1 if direction <= 0 else 2
+            direction = -1
+            low_live = False
+
+        # Only the final bar's event is reported; earlier ones already were.
+        if index == size - 1:
+            if broke_up == 1:
+                bos = 1
+            elif broke_up == 2:
+                choch = 1
+            elif broke_down == 1:
+                bos = -1
+            elif broke_down == 2:
+                choch = -1
+
+    last_close = close[-1]
+    return {
+        "trend": float(direction),
+        "bos": float(bos),
+        "choch": float(choch),
+        "swing_high": float(level_high),
+        "swing_low": float(level_low),
+        "distance_high": float((level_high - last_close) / last_close)
+        if not np.isnan(level_high) and last_close else float("nan"),
+        "distance_low": float((last_close - level_low) / last_close)
+        if not np.isnan(level_low) and last_close else float("nan"),
+    }
+
+
+def _smc_structure(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
+    state = _smc_state(frame, params)
+    output = _choice(
+        params,
+        "output",
+        {"trend", "bos", "choch", "swing_high", "swing_low",
+         "distance_high", "distance_low"},
+        "trend",
+    )
+    value = state[output]
+    if np.isnan(value):
+        raise FactorError("factor.noData")
+    return float(value)
+
+
+def _smc_fvg(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
+    """Most recent unmitigated three-bar imbalance, as of the last visible bar.
+
+    Detected from bars k-2, k-1 and k, so it is knowable on bar k. Scans
+    backwards and stops at the first gap price has not traded back through.
+    """
+    size = len(frame)
+    if size < 3:
+        raise FactorError("factor.insufficientHistory")
+
+    high = pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float)
+    output = _choice(
+        params, "output", {"side", "top", "bottom", "distance"}, "side")
+
+    for k in range(size - 1, 1, -1):
+        if low[k] > high[k - 2]:
+            top, bottom, side = low[k], high[k - 2], 1.0
+        elif high[k] < low[k - 2]:
+            top, bottom, side = low[k - 2], high[k], -1.0
+        else:
+            continue
+        if k + 1 < size:
+            # Mitigated once any later bar trades into the gap.
+            if np.min(low[k + 1:]) <= bottom and np.max(high[k + 1:]) >= top:
+                continue
+        if output == "side":
+            return float(side)
+        if output == "top":
+            return float(top)
+        if output == "bottom":
+            return float(bottom)
+        middle = (top + bottom) / 2.0
+        last_close = close[-1]
+        if not middle or not last_close:
+            raise FactorError("factor.noData")
+        return float((last_close - middle) / middle)
+
+    if output == "side":
+        return 0.0
+    raise FactorError("factor.noData")

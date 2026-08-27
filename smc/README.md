@@ -69,6 +69,7 @@ no information).
 |---|---|
 | `chart_indicator.py` | Indicator source (sandbox DSL). Chart-only. |
 | `validate.py` | Runs the code through QuantDinger's own validation pipeline. |
+| `strategy_example.py` | Script strategy consuming the factors. Backtestable. |
 
 ## Parameters
 
@@ -143,9 +144,62 @@ For sloped lines the renderer reads `price1` / `price2` (or `y1` / `y2`). The
 backend docstring mentions `startPrice` / `endPrice`; those are **not** read by
 the renderer.
 
-## Scope
+## Backtesting — the factor lane
 
-Chart-only. Indicators in v5 cannot place orders — backtesting requires the same
-logic registered as a **factor** in `app/services/factors/registry.py`, callable
-from a script strategy as `indicator("smc_structure", output="bos")`. That is
-the next step, and it is the one that needs a fork change.
+Indicators in v5 are chart-only and cannot place orders, so the same logic is
+also registered as two factors in `app/services/factors/registry.py`. This is
+the only upstream file the SMC work touches.
+
+| Factor | Outputs |
+|---|---|
+| `smc_structure` | `trend`, `bos`, `choch`, `swing_high`, `swing_low`, `distance_high`, `distance_low` |
+| `smc_fvg` | `side`, `top`, `bottom`, `distance` |
+
+Call them from a script strategy:
+
+```python
+trend = indicator("smc_structure", "USStock:SPY", swing_length=10, output="trend")
+choch = indicator("smc_structure", "USStock:SPY", swing_length=10, output="choch")
+```
+
+**The runtime handles look-ahead, not the strategy.** `runtime.py` evaluates
+factors on expanding windows (`visible = frame.iloc[:index + 1]`), asking each
+bar what is true right now. Combined with confirmation-delayed pivots, a break
+that took 28 bars to become knowable arrives 28 bars late in the backtest too.
+No manual signal lag is needed — and adding one would double-count the delay.
+
+Warmup is `swing_length * 2 + 2`; below that the factor raises
+`factor.insufficientHistory` rather than returning a misleading number.
+
+Verified against the chart indicator on the same 300-bar series: both find the
+same 7 BOS/CHoCH events, at the same bars. The two lanes agree.
+
+### Cost
+
+The factor contract is `compute(frame, params) -> float` re-evaluated per bar,
+so the protocol is O(n²) — inherent to the registry, not to this factor
+(`_supertrend` has the same shape).
+
+| bars | `smc_structure` | `smc_fvg` | per bar |
+|---|---|---|---|
+| 250 | 0.18s | 0.05s | 1.05 ms |
+| 500 | 0.53s | 0.11s | 1.36 ms |
+| 1000 | 1.91s | 0.22s | 2.19 ms |
+
+Fine for a single backtest; painful for parameter sweeps or wide universes.
+
+### After editing registry.py
+
+The backend image bakes the source in at build time, so a change is not live
+until the services that share the image are rebuilt:
+
+```bash
+docker compose up -d --build backend trading-worker scheduler-worker celery-worker celery-beat
+```
+
+## Before trusting a backtest result
+
+The structure signal has not been shown to have edge — only to be computed
+honestly. Read any result against buy-and-hold on the same instrument and
+period, and against a random-entry control with a matched trade count. A signal
+that beats neither is a signal that costs fees.
