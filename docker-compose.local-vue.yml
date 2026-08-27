@@ -1,0 +1,27 @@
+# 用本機的 QuantDinger-Vue 原始碼建前端，取代 GHCR 的預建 image。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local-vue.yml up -d --build frontend
+#
+# 為什麼不用上游的 docker-compose.build.yml：
+# 那個檔同時給 mobile 加了 build block，context 指向 ./QuantDinger-Mobile。
+# compose 在解析階段就會驗證所有 build context 路徑，該目錄不存在會直接
+# 中止整個指令 —— 連 frontend 都建不了。這裡只覆蓋 frontend，mobile 維持
+# 從 GHCR 拉預建 image。
+#
+# 兩個 fork 是平行放在 trade_dev/ 底下的兄弟目錄，不是巢狀，所以 context
+# 用 ../ 指過去。上游預設的 ./QuantDinger-Vue/ 巢狀擺法會讓一個 git repo
+# 躺在另一個 git repo 裡面，兩邊的 pull / branch 都比較難管。
+
+services:
+  frontend:
+    # 關掉主檔繼承來的 pull_policy: always。
+    # 不關的話，下一次 docker compose up 會用 GHCR 的 :latest 直接蓋掉
+    # 本機建好的 image，你改的 Vue 程式碼會無聲無息消失。
+    pull_policy: build
+    build:
+      context: ../QuantDinger-Vue
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-}
+        GIT_TAG: ${GIT_TAG:-${FRONTEND_TAG:-${IMAGE_TAG:-}}}
+    image: quantdinger-frontend:local
