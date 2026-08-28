@@ -155,12 +155,24 @@ the only upstream file the SMC work touches.
 | `smc_structure` | `trend`, `bos`, `choch`, `swing_high`, `swing_low`, `distance_high`, `distance_low` |
 | `smc_fvg` | `side`, `top`, `bottom`, `distance` |
 
-Call them from a script strategy:
+Call them from a script strategy with `factor()`, **not** `indicator()`:
 
 ```python
-trend = indicator("smc_structure", "USStock:SPY", swing_length=10, output="trend")
-choch = indicator("smc_structure", "USStock:SPY", swing_length=10, output="choch")
+trend = factor("smc_structure", "USStock:SPY", swing_length=10, output="trend")
+choch = factor("smc_structure", "USStock:SPY", swing_length=10, output="choch")
 ```
+
+Both read `portal.visible_frame`, so both are point-in-time — but they return
+different shapes:
+
+| Call | Returns |
+|---|---|
+| `factor(...)` | `float` — the value as of the current bar |
+| `indicator(...)` | `pd.Series` — the whole visible history |
+
+A decision needs the scalar. Comparing the Series with `>` raises
+*"The truth value of a Series is ambiguous"* at runtime, and the contract
+validator does not catch it at compile time.
 
 **The runtime handles look-ahead, not the strategy.** `runtime.py` evaluates
 factors on expanding windows (`visible = frame.iloc[:index + 1]`), asking each

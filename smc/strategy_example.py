@@ -10,10 +10,16 @@ try. Read the result against buy-and-hold on the same instrument and period, and
 against a random-entry control with the same trade count, before concluding
 anything.
 
-Look-ahead is handled by the runtime, not by this file. The factor is evaluated
-on expanding windows (`visible = frame.iloc[:index + 1]`), and its pivots are
-only confirmed swing_length bars after they print, so a break that took 28 bars
-to become knowable arrives 28 bars late here too.
+Look-ahead is handled by the runtime, not by this file. Both `factor()` and
+`indicator()` read `portal.visible_frame`, the point-in-time window, and SMC
+pivots are only confirmed swing_length bars after they print — so a break that
+took 28 bars to become knowable arrives 28 bars late here too. Do not add a
+manual signal lag on top; that would double-count the delay.
+
+Use `factor()`, not `indicator()`. `factor()` returns the scalar value as of the
+current bar, which is what a decision needs. `indicator()` returns a Series for
+the whole visible history — comparing it with `>` raises "The truth value of a
+Series is ambiguous".
 """
 
 # @param swing_length int 10 Bars each side required to confirm a swing range=4:24:1
@@ -37,8 +43,8 @@ def handle_data(context, data):
     target_pct = float(context.params.get("target_pct", 0.5))
     entry_mode = int(context.params.get("entry_mode", 0))
 
-    trend = indicator("smc_structure", SYMBOL,
-                      swing_length=swing_length, output="trend")
+    trend = factor("smc_structure", SYMBOL,
+                   swing_length=swing_length, output="trend")
     if trend is None:
         return
 
@@ -51,8 +57,8 @@ def handle_data(context, data):
         # whenever structure is no longer bullish. A CHoCH is the first break
         # against the prevailing direction, i.e. the turn rather than the
         # continuation.
-        choch = indicator("smc_structure", SYMBOL,
-                          swing_length=swing_length, output="choch")
+        choch = factor("smc_structure", SYMBOL,
+                       swing_length=swing_length, output="choch")
         position = get_position(SYMBOL)
         holding = position is not None and position.amount > 0
 
