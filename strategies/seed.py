@@ -118,7 +118,21 @@ def build_param_schema(code: str) -> dict:
     Seeding it makes the declared parameters adjustable in the UI, and makes
     the values land in the run history where they can be compared.
     """
+    import re
+
     from app.services.indicator_params import IndicatorParamsParser
+
+    # IndicatorParamsParser only reads `values=` for numeric parameters -- its
+    # sweep grammar is documented as numeric-only -- so a string parameter such
+    # as a timeframe loses its choices and the form falls back to a number
+    # input it can never accept. Pick the list off the raw @param line instead.
+    choices: dict[str, list[str]] = {}
+    for name, raw in re.findall(r"^#\s*@param\s+(\w+)\s+\S+\s+\S+\s*(.*)$", code, re.M):
+        found = re.search(r"values\s*=\s*(\S+)", raw, re.I)
+        if found:
+            values = [v.strip() for v in found.group(1).split(",") if v.strip()]
+            if values:
+                choices[name] = values
 
     params = []
     for item in IndicatorParamsParser.parse_params(code):
@@ -132,12 +146,16 @@ def build_param_schema(code: str) -> dict:
         }
         # The form renders a number input, so give it the bounds the @param
         # range already declares rather than leaving it unbounded.
-        numeric = [v for v in values if isinstance(v, (int, float))]
-        if numeric:
-            entry["min"] = min(numeric)
-            entry["max"] = max(numeric)
-            if len(numeric) > 1:
-                entry["step"] = abs(numeric[1] - numeric[0]) or 1
+        declared = choices.get(str(item.get("name")))
+        if declared:
+            entry["options"] = declared
+        else:
+            numeric = [v for v in values if isinstance(v, (int, float))]
+            if numeric:
+                entry["min"] = min(numeric)
+                entry["max"] = max(numeric)
+                if len(numeric) > 1:
+                    entry["step"] = abs(numeric[1] - numeric[0]) or 1
         params.append(entry)
     return {"params": params}
 
