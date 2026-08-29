@@ -59,8 +59,30 @@ ITEMS = [
         "description": (
             "SMC Model 3：回測未緩解的公允價值缺口，停損放在造成缺口的位移 K 棒後方，"
             "停利用固定 R 倍數。注意 reward_r 是實作時選的，原始模型只給進場與停損、"
-            "沒有出場規則。BTC 800 天實測 8 筆交易、報酬 −12% 到 −1%，"
-            "同期買進持有 +165%。幣圈回測區間上限約 868 天（1095 減去 warmup）。"
+            "沒有出場規則。BTC 800 天實測：4h 週期 61 筆、PF 0.97，1d 只有 10 筆。"
+            "signal_timeframe 可切 4h/1d。幣圈回測區間上限約 868 天。"
+        ),
+    },
+    {
+        "path": "smc/sweep_choch.py",
+        "run_config": "BTC",
+        "name": "SMC 掃蕩→CHoCH",
+        "aliases": ["SMC 掃蕩→CHoCH", "SMC Sweep to CHoCH"],
+        "description": (
+            "SMC Model 1：影線掃掉前低但收盤守住，隨後結構轉多才進場，停損放在掃蕩極值外。"
+            "smc_sweep factor 專為此模型而生 —— BOS 定義在收盤，掃蕩正好相反，"
+            "只看收盤的 smc_structure 看不到它。choch_window 與 reward_r 是實作時選的。"
+        ),
+    },
+    {
+        "path": "smc/ob_continuation.py",
+        "run_config": "BTC",
+        "name": "SMC 訂單塊順勢",
+        "aliases": ["SMC 訂單塊順勢", "SMC Order Block Continuation"],
+        "description": (
+            "SMC Model 2：結構偏多時，等價格回測造成突破的未緩解訂單塊。"
+            "訂單塊只在其造成的突破確認後才浮現，不是在該 K 棒當下。"
+            "BTC 800 天 4h 實測 29 筆、PF 1.19，1d 只有 5 筆、PF 0.34。"
         ),
     },
 ]

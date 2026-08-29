@@ -70,7 +70,7 @@ def _technical_warmup(factor_id: str, params: Mapping[str, Any]) -> int:
         return int(params.get("slow_period") or 10)
     if factor_id in {"obv", "ad_line"}:
         return period + 1
-    if factor_id in {"smc_structure", "smc_fvg"}:
+    if factor_id in {"smc_structure", "smc_fvg", "smc_sweep", "smc_ob"}:
         # A pivot needs swing_length bars on each side, plus a bar for the
         # break to land on. Below this the structure is not yet defined.
         return int(params.get("swing_length") or 10) * 2 + 2
@@ -114,8 +114,10 @@ _OUTPUT_OPTIONS = {
     "macd": ("line", "signal", "histogram"),
     "obv": ("value", "slope"),
     "smc_fvg": ("side", "top", "bottom", "distance", "stop", "age"),
+    "smc_ob": ("side", "top", "bottom", "stop", "distance", "age"),
     "smc_structure": ("trend", "bos", "choch", "swing_high", "swing_low",
                       "distance_high", "distance_low"),
+    "smc_sweep": ("side", "level", "extreme", "age"),
     "stochastic": ("k", "d"),
     "supertrend": ("direction", "line"),
     "vwap": ("value", "distance"),
@@ -220,6 +222,8 @@ _FACTORS = {
         _technical("amihud_illiquidity", "liquidity", ("close", "volume"), {"period": 20}, "lower_is_bullish", lambda f, p: _amihud_illiquidity(f, p)),
         _technical("smc_structure", "trend", ("high", "low", "close"), {"swing_length": 10, "output": "trend"}, "higher_is_bullish", lambda f, p: _smc_structure(f, p)),
         _technical("smc_fvg", "trend", ("high", "low", "close"), {"output": "side"}, "higher_is_bullish", lambda f, p: _smc_fvg(f, p)),
+        _technical("smc_sweep", "trend", ("high", "low", "close"), {"swing_length": 10, "lookback": 60, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_sweep(f, p)),
+        _technical("smc_ob", "trend", ("open", "high", "low", "close"), {"swing_length": 10, "search": 30, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_ob(f, p)),
         _fundamental("market_cap", "size", ("market_cap",), "lower_is_bullish", lambda f, p: _last_value(f, "market_cap")),
         _fundamental("earnings_yield", "valuation", ("net_income", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "net_income", "market_cap")),
         _fundamental("book_to_price", "valuation", ("book_value", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "book_value", "market_cap")),
@@ -1063,59 +1067,84 @@ def _smc_swings(high: np.ndarray, low: np.ndarray, n: int) -> tuple[np.ndarray, 
     return is_high, is_low
 
 
-def _smc_state(frame: pd.DataFrame, params: Mapping[str, Any]) -> dict[str, float]:
-    """Replay the visible window and report the structure as of its last bar."""
+def _smc_bars(frame: pd.DataFrame, params: Mapping[str, Any]):
+    """Shared validation and column extraction for the SMC factors."""
     swing_length = int(params.get("swing_length") or 10)
     if swing_length < 2:
         raise FactorError("factor.badParams")
     size = len(frame)
     if size < 2 * swing_length + 2:
         raise FactorError("factor.insufficientHistory")
+    return (
+        swing_length,
+        size,
+        pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype=float),
+        pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype=float),
+        pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float),
+    )
 
-    high = pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype=float)
-    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype=float)
-    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float)
 
+def _smc_replay(high, low, close, swing_length: int, size: int):
+    """Bar-by-bar structure replay -- the single definition of BOS and CHoCH.
+
+    Returns (events, direction, level_high, level_low, last_event) where events
+    is a list of (break_index, pivot_index, level, kind, direction) with kind
+    1 = BOS and 2 = CHoCH.
+
+    Every SMC factor derives from this rather than repeating the loop, because
+    a second copy would drift and the two would disagree about what the market
+    structure is.
+    """
     is_high, is_low = _smc_swings(high, low, swing_length)
 
+    events: list[tuple[int, int, float, int, int]] = []
     level_high = float("nan")
     level_low = float("nan")
+    pivot_high = -1
+    pivot_low = -1
     high_live = False
     low_live = False
     direction = 0
-    bos = 0
-    choch = 0
+    last_event = (0, 0)          # (bos, choch) on the final bar
 
     for index in range(size):
         # The pivot at index - swing_length becomes knowable exactly now.
         pivot = index - swing_length
         if pivot >= 0:
             if is_high[pivot]:
-                level_high, high_live = high[pivot], True
+                level_high, pivot_high, high_live = high[pivot], pivot, True
             if is_low[pivot]:
-                level_low, low_live = low[pivot], True
+                level_low, pivot_low, low_live = low[pivot], pivot, True
 
         broke_up = 0
         broke_down = 0
         if high_live and not np.isnan(level_high) and close[index] > level_high:
             broke_up = 1 if direction >= 0 else 2      # 1 = BOS, 2 = CHoCH
+            events.append((index, pivot_high, float(level_high), broke_up, 1))
             direction = 1
             high_live = False
         elif low_live and not np.isnan(level_low) and close[index] < level_low:
             broke_down = 1 if direction <= 0 else 2
+            events.append((index, pivot_low, float(level_low), broke_down, -1))
             direction = -1
             low_live = False
 
         # Only the final bar's event is reported; earlier ones already were.
         if index == size - 1:
-            if broke_up == 1:
-                bos = 1
-            elif broke_up == 2:
-                choch = 1
-            elif broke_down == 1:
-                bos = -1
-            elif broke_down == 2:
-                choch = -1
+            last_event = (
+                1 if broke_up == 1 else (-1 if broke_down == 1 else 0),
+                1 if broke_up == 2 else (-1 if broke_down == 2 else 0),
+            )
+
+    return events, direction, level_high, level_low, last_event
+
+
+def _smc_state(frame: pd.DataFrame, params: Mapping[str, Any]) -> dict[str, float]:
+    """Replay the visible window and report the structure as of its last bar."""
+    swing_length, size, high, low, close = _smc_bars(frame, params)
+    _events, direction, level_high, level_low, last_event = _smc_replay(
+        high, low, close, swing_length, size)
+    bos, choch = last_event
 
     last_close = close[-1]
     return {
@@ -1191,6 +1220,143 @@ def _smc_fvg(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
             return float(stop)
         if output == "age":
             return float(size - 1 - k)
+        middle = (top + bottom) / 2.0
+        last_close = close[-1]
+        if not middle or not last_close:
+            raise FactorError("factor.noData")
+        return float((last_close - middle) / middle)
+
+    if output == "side":
+        return 0.0
+    raise FactorError("factor.noData")
+
+
+def _smc_sweep(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
+    """Most recent liquidity sweep: a wick through a confirmed swing that the
+    close did not hold beyond.
+
+    This is the piece Model 1 turns on. A break of structure is defined on the
+    CLOSE -- price accepted the new level -- while a sweep is the opposite: the
+    wick took the stops resting past the level and the close came back. Testing
+    only closes, as the structure factor does, cannot see it at all.
+
+    Knowable on the sweep bar itself: the pivot was confirmed swing_length bars
+    earlier, and the wick and close both belong to the current bar.
+
+      side     1 = lows swept (bullish reaction expected), -1 = highs swept
+      level    the swept swing level
+      extreme  the wick extreme -- where a stop goes, beyond the sweep
+      age      bars since the sweep
+    """
+    swing_length, size, high, low, close = _smc_bars(frame, params)
+    lookback = max(1, int(params.get("lookback") or 60))
+    output = _choice(
+        params, "output", {"side", "level", "extreme", "age"}, "side")
+
+    is_high, is_low = _smc_swings(high, low, swing_length)
+
+    # Walk back from the last bar; the first sweep found is the live one.
+    start = max(swing_length, size - lookback)
+    for index in range(size - 1, start - 1, -1):
+        # Only pivots confirmed before this bar were visible to it.
+        usable = index - swing_length
+        if usable < 0:
+            break
+
+        highs = [i for i in range(usable + 1) if is_high[i]]
+        lows = [i for i in range(usable + 1) if is_low[i]]
+
+        if lows:
+            level = low[lows[-1]]
+            if low[index] < level and close[index] > level:
+                if output == "side":
+                    return 1.0
+                if output == "level":
+                    return float(level)
+                if output == "extreme":
+                    return float(low[index])
+                return float(size - 1 - index)
+
+        if highs:
+            level = high[highs[-1]]
+            if high[index] > level and close[index] < level:
+                if output == "side":
+                    return -1.0
+                if output == "level":
+                    return float(level)
+                if output == "extreme":
+                    return float(high[index])
+                return float(size - 1 - index)
+
+    if output == "side":
+        return 0.0
+    raise FactorError("factor.noData")
+
+
+def _smc_ob(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
+    """Most recent unmitigated order block -- the last opposing candle before
+    the move that broke structure.
+
+    This is the piece Model 2 turns on. An order block is only meaningful once
+    the break it preceded has happened, so it becomes knowable at the BREAK
+    bar, not at the candle itself. Reporting it earlier would hand the strategy
+    a level the market had not yet justified.
+
+      side      1 = bullish (demand), -1 = bearish (supply)
+      top       the block candle's high
+      bottom    the block candle's low
+      stop      just beyond the block -- below it for a bullish one
+      distance  close relative to the block midpoint
+      age       bars since the block candle
+    """
+    swing_length, size, high, low, close = _smc_bars(frame, params)
+    open_ = pd.to_numeric(frame["open"], errors="coerce").to_numpy(dtype=float)
+    search = max(2, int(params.get("search") or 30))
+    output = _choice(
+        params, "output",
+        {"side", "top", "bottom", "stop", "distance", "age"}, "side")
+
+    events, _direction, _lh, _ll, _last = _smc_replay(
+        high, low, close, swing_length, size)
+
+    for break_index, _pivot, _level, _kind, side in reversed(events):
+        found = -1
+        floor_index = max(break_index - search, 0)
+        for j in range(break_index - 1, floor_index - 1, -1):
+            # The last candle against the direction of the break.
+            if side > 0 and close[j] < open_[j]:
+                found = j
+                break
+            if side < 0 and close[j] > open_[j]:
+                found = j
+                break
+        if found < 0:
+            continue
+
+        # Mitigated once price traded back through the block.
+        mitigated = False
+        for j in range(found + 1, size):
+            if side > 0 and low[j] <= low[found]:
+                mitigated = True
+                break
+            if side < 0 and high[j] >= high[found]:
+                mitigated = True
+                break
+        if mitigated:
+            continue
+
+        top = float(high[found])
+        bottom = float(low[found])
+        if output == "side":
+            return float(side)
+        if output == "top":
+            return top
+        if output == "bottom":
+            return bottom
+        if output == "stop":
+            return bottom if side > 0 else top
+        if output == "age":
+            return float(size - 1 - found)
         middle = (top + bottom) / 2.0
         last_close = close[-1]
         if not middle or not last_close:
