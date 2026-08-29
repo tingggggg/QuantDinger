@@ -49,6 +49,16 @@ ITEMS = [
             "策略端不要再自行加 signal lag。尚未證明有超額報酬。"
         ),
     },
+    {
+        "path": "smc/fvg_sniper.py",
+        "name": "SMC FVG 狙擊進場",
+        "aliases": ["SMC FVG 狙擊進場", "SMC FVG Sniper"],
+        "description": (
+            "SMC Model 3：回測未緩解的公允價值缺口，停損放在造成缺口的位移 K 棒後方，"
+            "停利用固定 R 倍數。注意 reward_r 是實作時選的，原始模型只給進場與停損、"
+            "沒有出場規則。SPY 2018-2025 實測所有參數組合的 Profit Factor 都小於 1。"
+        ),
+    },
 ]
 
 DEFAULT_RUN_CONFIG = {

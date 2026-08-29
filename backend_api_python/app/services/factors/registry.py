@@ -113,7 +113,7 @@ _OUTPUT_OPTIONS = {
     "keltner_channels": ("upper", "middle", "lower", "position"),
     "macd": ("line", "signal", "histogram"),
     "obv": ("value", "slope"),
-    "smc_fvg": ("side", "top", "bottom", "distance"),
+    "smc_fvg": ("side", "top", "bottom", "distance", "stop", "age"),
     "smc_structure": ("trend", "bos", "choch", "swing_high", "swing_low",
                       "distance_high", "distance_low"),
     "stochastic": ("k", "d"),
@@ -1160,13 +1160,21 @@ def _smc_fvg(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype=float)
     close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float)
     output = _choice(
-        params, "output", {"side", "top", "bottom", "distance"}, "side")
+        params, "output", {"side", "top", "bottom", "distance", "stop", "age"},
+        "side")
 
     for k in range(size - 1, 1, -1):
         if low[k] > high[k - 2]:
             top, bottom, side = low[k], high[k - 2], 1.0
+            # Invalidation sits behind the displacement candle -- bar k-1, the
+            # one whose move opened the gap -- not behind the gap itself. A
+            # stop just under the gap edge sits inside the noise the gap was
+            # created by, and gets taken out by the retest that forms the
+            # entry.
+            stop = min(low[k - 1], low[k - 2])
         elif high[k] < low[k - 2]:
             top, bottom, side = low[k - 2], high[k], -1.0
+            stop = max(high[k - 1], high[k - 2])
         else:
             continue
         if k + 1 < size:
@@ -1179,6 +1187,10 @@ def _smc_fvg(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
             return float(top)
         if output == "bottom":
             return float(bottom)
+        if output == "stop":
+            return float(stop)
+        if output == "age":
+            return float(size - 1 - k)
         middle = (top + bottom) / 2.0
         last_close = close[-1]
         if not middle or not last_close:
