@@ -68,14 +68,25 @@ m = len(df)
 n = swing_length
 last = m - 1
 
-BULL = '#26A69A'
-BEAR = '#EF5350'
-OB_BULL = '#1B7A6E'
-OB_BEAR = '#A63A3A'
-GAP = '#5C9EAD'
+# Palette. Two zone families share the chart, so hue separates the TYPE and
+# warm/cool separates the DIRECTION -- otherwise a bullish order block and a
+# bullish gap sit next to each other in the same blue-green and stop being
+# distinguishable at a glance.
+#
+#   Order block   teal  / crimson    saturated, heavier fill
+#   Fair value gap  indigo / amber   lighter fill, dashed border
+BULL = '#26A69A'          # candles / structure, bullish
+BEAR = '#EF5350'          # candles / structure, bearish
+OB_BULL = '#00897B'       # order block, bullish   -- teal
+OB_BEAR = '#C2185B'       # order block, bearish   -- crimson
+FVG_BULL = '#3949AB'      # fair value gap, bullish -- indigo
+FVG_BEAR = '#EF6C00'      # fair value gap, bearish -- amber
 LIQ = '#C79A3C'
 PREV = '#8E86C9'
 SESS = '#5A6270'
+
+OB_OPACITY = 0.22         # heavier: an order block is a price area that acted
+FVG_OPACITY = 0.13        # lighter: a gap is an absence, not a level
 
 layers = []
 
@@ -172,10 +183,13 @@ for k in range(2, m):
 
 if show_fvg == 1:
     for k, end, top, bottom, side in fvgs[-max_items:]:
+        col = FVG_BULL if side > 0 else FVG_BEAR
+        txt = 'FVG' + ('↑' if side > 0 else '↓')
         layers.append({'type': 'zone', 'startIndex': k, 'endIndex': end,
-                       'top': top, 'bottom': bottom, 'text': 'FVG',
-                       'fillColor': GAP, 'borderColor': GAP, 'opacity': 0.16,
-                       'textColor': GAP, 'fontSize': 10})
+                       'top': top, 'bottom': bottom, 'text': txt,
+                       'fillColor': col, 'borderColor': col,
+                       'opacity': FVG_OPACITY, 'dashed': True,
+                       'textColor': col, 'fontSize': 10})
 
 # --- 4) Order blocks -------------------------------------------------------
 # The last opposing candle before the move that broke structure. Derived from
@@ -208,10 +222,11 @@ if show_ob == 1:
     for start, end, top, bottom, v, side in obs[-max_items:]:
         share = (v / total_vol * 100.0) if total_vol > 0 else 0.0
         col = OB_BULL if side > 0 else OB_BEAR
-        txt = 'OB ' + str(round(share, 1)) + '%'
+        txt = 'OB' + ('↑' if side > 0 else '↓') + ' ' + str(round(share, 1)) + '%'
         layers.append({'type': 'zone', 'startIndex': start, 'endIndex': end,
                        'top': top, 'bottom': bottom, 'text': txt,
-                       'fillColor': col, 'borderColor': col, 'opacity': 0.20,
+                       'fillColor': col, 'borderColor': col,
+                       'opacity': OB_OPACITY,
                        'textColor': col, 'fontSize': 10})
 
 # --- 5) Liquidity ----------------------------------------------------------
