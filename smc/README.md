@@ -212,6 +212,18 @@ docker compose up -d --build backend trading-worker scheduler-worker celery-work
 ## Before trusting a backtest result
 
 The structure signal has not been shown to have edge — only to be computed
-honestly. Read any result against buy-and-hold on the same instrument and
-period, and against a random-entry control with a matched trade count. A signal
-that beats neither is a signal that costs fees.
+honestly. Judge it against
+[`../strategies/buy_and_hold.py`](../strategies/buy_and_hold.py) in **mode 1**,
+at the strategy's own measured exposure. Beating 100% buy-and-hold is the wrong
+bar in either direction: a strategy that holds less will usually lose to it in a
+bull run however good its timing, and one that holds more can beat it with none.
+
+Measured so far, SPY 2018-2025 at 71.4% exposure: SMC 96.5%, fixed weight at the
+same exposure 110.7%, buy-and-hold 155.0%. The timing was worth **−14.2 points**,
+and cost 290 round trips.
+
+Across seven US instruments, five lost to same-exposure passive; only TSLA beat
+buy-and-hold. Five crypto instruments all beat same-exposure passive over a
+2023-2025 window, but that sample is hand-picked survivors over one regime —
+precisely the bias that inverted earlier crypto results elsewhere in this
+workspace. Treat it as unverified.

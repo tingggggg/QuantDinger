@@ -1555,6 +1555,15 @@ class StrategyV2BacktestRunner:
         if timestamps.empty:
             raise StrategyV2ContractError("strategyV2.backtestRangeEmpty")
 
+        # Publish the run window so a strategy can size a schedule against the
+        # period it was actually given, instead of asking the user to restate
+        # in a parameter what the backtest form already knows. A DCA benchmark
+        # needs exactly this: instalment = capital / (window / interval).
+        # Absent in live trading, where there is no end -- read defensively.
+        self.context.backtest_start = pd.Timestamp(timestamps[0])
+        self.context.backtest_end = pd.Timestamp(timestamps[-1])
+        self.context.backtest_bars = int(len(timestamps))
+
         previous: pd.Timestamp | None = None
         pending_orders: list[OrderIntent] = []
         for timestamp in timestamps:
