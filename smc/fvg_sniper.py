@@ -23,9 +23,14 @@ WHAT THE SOURCE MODEL DOES NOT SPECIFY
   result knowing that.
 
 LONG ONLY
-  The mirrored short side is deliberately absent. US equities backtested here
-  are long-biased and adding shorts would mix two different questions into one
-  number.
+  The mirrored short side is deliberately absent. Adding it would mix two
+  different questions into one number.
+
+BACKTEST RANGE ON CRYPTO
+  Crypto has no market-specific range policy, so it falls back to the 1D
+  default of 1095 days. The 120-bar warmup costs 227 calendar days of that,
+  leaving roughly 868 usable. Ask for more and the run fails with
+  strategyV2.backtestRangeLimit before it starts.
 """
 
 # @param entry_pct float 0.5 Where in the gap to buy: 0 = near edge, 1 = far edge range=0:1:0.05
@@ -35,7 +40,7 @@ LONG ONLY
 # @param swing_length int 10 Bars each side to confirm a swing, for the trend filter range=4:24:1
 # @param size_pct float 1.0 Portfolio share to commit per trade range=0.1:1.0:0.05
 
-SYMBOL = "USStock:SPY"
+SYMBOL = "Crypto:BTC/USDT@spot"
 
 
 def initialize(context):

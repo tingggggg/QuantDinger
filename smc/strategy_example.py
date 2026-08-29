@@ -26,7 +26,7 @@ Series is ambiguous".
 # @param target_pct float 0.5 Target portfolio weight while long range=0.1:1.0:0.05
 # @param entry_mode int 0 0 = follow trend state, 1 = require a CHoCH to enter range=0:1:1
 
-SYMBOL = "USStock:SPY"
+SYMBOL = "Crypto:BTC/USDT@spot"
 
 
 def initialize(context):

@@ -31,6 +31,7 @@ ROOT = os.environ.get("SEED_ROOT", "/repo")
 ITEMS = [
     {
         "path": "strategies/buy_and_hold.py",
+        "run_config": "US",
         "name": "長期買進 / DCA 基準",
         "aliases": ["長期買進 / DCA 基準", "Long-Term Buy Strategy"],
         "description": (
@@ -41,6 +42,7 @@ ITEMS = [
     },
     {
         "path": "smc/strategy_example.py",
+        "run_config": "BTC",
         "name": "SMC 結構跟隨",
         "aliases": ["SMC 結構跟隨", "SMC Structure Following"],
         "description": (
@@ -51,25 +53,37 @@ ITEMS = [
     },
     {
         "path": "smc/fvg_sniper.py",
+        "run_config": "BTC",
         "name": "SMC FVG 狙擊進場",
         "aliases": ["SMC FVG 狙擊進場", "SMC FVG Sniper"],
         "description": (
             "SMC Model 3：回測未緩解的公允價值缺口，停損放在造成缺口的位移 K 棒後方，"
             "停利用固定 R 倍數。注意 reward_r 是實作時選的，原始模型只給進場與停損、"
-            "沒有出場規則。SPY 2018-2025 實測所有參數組合的 Profit Factor 都小於 1。"
+            "沒有出場規則。BTC 800 天實測 8 筆交易、報酬 −12% 到 −1%，"
+            "同期買進持有 +165%。幣圈回測區間上限約 868 天（1095 減去 warmup）。"
         ),
     },
 ]
 
-DEFAULT_RUN_CONFIG = {
-    "market_category": "USStock",
-    "symbol": "SPY",
-    "timeframe": "1d",
-    "initial_capital": 50000,
-    "investment_amount": 50000,
-    "trade_direction": "long",
-    "leverage": 1,
-}
+def run_config(market: str, symbol: str) -> dict:
+    """Prefill for the backtest form. Must match the strategy's own universe --
+    the form does not read it to pick instruments, but a mismatch is confusing.
+    """
+    return {
+        "market_category": market,
+        "symbol": symbol,
+        "timeframe": "1d",
+        "initial_capital": 50000,
+        "investment_amount": 50000,
+        "trade_direction": "long",
+        "leverage": 1,
+    }
+
+
+US = run_config("USStock", "SPY")
+# Crypto falls back to the default 1D range policy of 1095 days, and a 120-bar
+# warmup eats 227 of them -- so a crypto strategy has about 868 usable days.
+BTC = run_config("Crypto", "BTC/USDT")
 
 
 def existing_rows(get_db_connection):
@@ -125,7 +139,7 @@ def main() -> int:
                 # here rather than at backtest time.
                 metadata, manifest = canonical_source_metadata(code, {
                     "description": item["description"],
-                    "last_run_config": dict(DEFAULT_RUN_CONFIG),
+                    "last_run_config": dict(US if item.get("run_config") == "US" else BTC),
                     "seed_key": item["path"],
                     "script_verified": True,
                     "lifecycle_verified": True,
