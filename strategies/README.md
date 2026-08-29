@@ -1,7 +1,32 @@
 # Strategies
 
-General-purpose Strategy API V2 sources. Paste into the strategy editor, or run
-programmatically (see below). SMC-specific work lives in [`../smc/`](../smc/).
+General-purpose Strategy API V2 sources. SMC-specific work lives in
+[`../smc/`](../smc/).
+
+## Loading them into the web UI
+
+**Strategies live in the database, not on disk.** The UI reads
+`qd_script_sources`; editing a file here changes nothing until it is loaded:
+
+```bash
+./strategies/seed.sh
+```
+
+Safe to re-run — it updates in place. Re-run it after editing any strategy, or
+after resetting the database.
+
+Getting that right took a few tries, and the reasons are worth knowing before
+writing a similar script:
+
+- **Match on more than one key.** `name` is rewritten to the code's docstring
+  title on save, so matching by name misses on the second run and creates a
+  duplicate. `seed_key` in metadata has also been seen to disappear, replaced by
+  a row carrying `script_template_params` — a key that appears nowhere in the
+  backend source. The script matches on either.
+- **Go through `ScriptSourceService`, not raw SQL.** `create_source` writes the
+  version table too; a direct INSERT leaves version history broken.
+- **Duplicates are reported, never deleted.** A row matching by name could be
+  something hand-written in the UI.
 
 ## `buy_and_hold.py` — the benchmark arm
 
