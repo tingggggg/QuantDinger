@@ -108,6 +108,40 @@ US = run_config("USStock", "SPY")
 BTC = run_config("Crypto", "BTC/USDT")
 
 
+def build_param_schema(code: str) -> dict:
+    """Turn the source's `# @param` lines into the shape the backtest form reads.
+
+    Nothing else populates this. The route does not derive it on save and the
+    frontend only ever reads it, so a source stored without one shows an empty
+    parameter panel -- which is why every run in this install recorded
+    `params={}` and every parameter had to be varied by editing the code.
+    Seeding it makes the declared parameters adjustable in the UI, and makes
+    the values land in the run history where they can be compared.
+    """
+    from app.services.indicator_params import IndicatorParamsParser
+
+    params = []
+    for item in IndicatorParamsParser.parse_params(code):
+        kind = str(item.get("type") or "").lower()
+        values = item.get("values") or []
+        entry = {
+            "name": item.get("name"),
+            "type": "boolean" if kind == "bool" else ("string" if kind in ("str", "string") else "number"),
+            "default": item.get("default"),
+            "description": item.get("description") or "",
+        }
+        # The form renders a number input, so give it the bounds the @param
+        # range already declares rather than leaving it unbounded.
+        numeric = [v for v in values if isinstance(v, (int, float))]
+        if numeric:
+            entry["min"] = min(numeric)
+            entry["max"] = max(numeric)
+            if len(numeric) > 1:
+                entry["step"] = abs(numeric[1] - numeric[0]) or 1
+        params.append(entry)
+    return {"params": params}
+
+
 def existing_rows(get_db_connection):
     """Every strategy row for user 1, with whatever identity it still carries.
 
@@ -181,6 +215,7 @@ def main() -> int:
                     "description": item["description"],
                     "code": code,
                     "metadata": metadata,
+                    "param_schema": build_param_schema(code),
                 })
                 print(f"  ~ updated id={source_id}  {item['name']}")
                 for stale in sorted(hits):
@@ -197,6 +232,7 @@ def main() -> int:
                     "code": code,
                     "asset_type": "script",
                     "metadata": metadata,
+                    "param_schema": build_param_schema(code),
                     "status": "ready",
                     "visibility": "private",
                 })
@@ -206,7 +242,8 @@ def main() -> int:
             print(f"      universe={[i.get('instrument_id') for i in universe]}"
                   f"  warmup={manifest.get('warmupBars')}"
                   f"  freq={manifest.get('frequencies')}"
-                  f"  schedules={len(manifest.get('schedules') or [])}")
+                  f"  schedules={len(manifest.get('schedules') or [])}"
+                  f"  params={len(build_param_schema(code)['params'])}")
 
         print()
         print("qd_script_sources:")
