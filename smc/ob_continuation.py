@@ -35,12 +35,16 @@ TIMEFRAME
   It cannot be a plain subscribe() argument: context.subscribe runs inside
   initialize, where context.params is unavailable.
 
-  Only 4h and 1d are offered. The runtime drives on the SMALLEST subscribed
-  frequency, so subscribing to 1h would make every run 1h-driven -- including
-  the ones reading daily signals. Measured on this factor set, which is O(n^2)
-  in bar count: 200 days at 1h took 101s, 400 days took 339s, and 800 days did
-  not finish inside ten minutes. A 1h option would cost every other run 24x
-  for the benefit of one.
+  1h, 4h and 1d are offered. Anything finer is capped by the data provider
+  (30m allows 365 days, 5m only 180) and 1w is not offered because a 120-bar
+  weekly warmup costs 960 calendar days of the 1095-day crypto budget, leaving
+  135 days to actually test in -- and the range limit takes the strictest
+  subscribed frequency, so adding it would shrink every run's window.
+
+  1h was impossible until the replay was made incremental. The runtime drives
+  on the SMALLEST subscribed frequency, so 1h drives every run at 1h whichever
+  timeframe the signals are read at; on the old O(n^2) replay 800 days did not
+  finish inside ten minutes. It now takes about a minute.
 
   On daily bars a 800-day crypto window holds ~570 decision points; on 4h it
   holds ~4800. These models need several conditions to coincide, so the daily
@@ -51,7 +55,7 @@ BACKTEST RANGE ON CRYPTO
   costs 227 of them, leaving roughly 868 usable.
 """
 
-# @param signal_timeframe str 4h Bars the SMC factors read values=4h,1d
+# @param signal_timeframe str 4h Bars the SMC factors read values=1h,4h,1d
 # @param swing_length int 10 Bars each side to confirm a swing range=4:24:1
 # @param reward_r float 2.0 Target as a multiple of risk -- chosen here, not from the model range=0.5:6:0.25
 # @param require_fvg int 0 Require a live fair value gap alongside the block range=0:1:1
@@ -63,6 +67,7 @@ SYMBOL = "Crypto:BTC/USDT@spot"
 
 def initialize(context):
     context.set_universe([SYMBOL])
+    context.subscribe(frequency="1h", fields=["open", "high", "low", "close"])
     context.subscribe(frequency="4h", fields=["open", "high", "low", "close"])
     context.subscribe(frequency="1d", fields=["open", "high", "low", "close"])
     context.set_warmup(120)

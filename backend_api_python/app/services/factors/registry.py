@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
@@ -1039,32 +1040,21 @@ def _amihud_illiquidity(frame: pd.DataFrame, params: Mapping[str, Any]) -> float
 # the definition, not a bug in the package -- but it is unusable as a factor.
 
 
-def _smc_swings(high: np.ndarray, low: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
-    """Strict swing pivots. Bars within `n` of either edge can never qualify.
+def _smc_confirm_swings(high, low, n, is_high, is_low, first, last) -> None:
+    """Mark strict swing pivots for indices in [first, last), in place.
 
-    Candidates come from a centred rolling max/min (cheap, vectorised); the
-    strictness check then runs only on those few bars rather than every bar.
+    A pivot at i is decided by the window [i-n, i+n] alone, so its value never
+    depends on how much data follows. That is what makes the incremental path
+    below exact rather than approximate: any index already decided stays
+    decided, and extending the frame can only decide new ones.
     """
-    size = len(high)
-    is_high = np.zeros(size, dtype=bool)
-    is_low = np.zeros(size, dtype=bool)
-    if size < 2 * n + 1:
-        return is_high, is_low
-
-    window = 2 * n + 1
-    roll_high = pd.Series(high).rolling(window, center=True).max().to_numpy()
-    roll_low = pd.Series(low).rolling(window, center=True).min().to_numpy()
-
-    for index in range(n, size - n):
-        if high[index] == roll_high[index]:
-            segment = high[index - n:index + n + 1]
-            if int(np.sum(segment == high[index])) == 1:
-                is_high[index] = True
-        if low[index] == roll_low[index]:
-            segment = low[index - n:index + n + 1]
-            if int(np.sum(segment == low[index])) == 1:
-                is_low[index] = True
-    return is_high, is_low
+    for index in range(first, last):
+        segment = high[index - n:index + n + 1]
+        if high[index] == np.max(segment) and int(np.sum(segment == high[index])) == 1:
+            is_high[index] = True
+        segment = low[index - n:index + n + 1]
+        if low[index] == np.min(segment) and int(np.sum(segment == low[index])) == 1:
+            is_low[index] = True
 
 
 def _smc_bars(frame: pd.DataFrame, params: Mapping[str, Any]):
@@ -1084,6 +1074,24 @@ def _smc_bars(frame: pd.DataFrame, params: Mapping[str, Any]):
     )
 
 
+# Replay state, keyed by series identity and swing length. The runtime calls
+# every factor once per bar on an expanding window, so recomputing the whole
+# replay each time is O(n^2) in bar count -- 400 days of 1h bars took 339s and
+# 800 days did not finish. Resuming from the previous bar makes it O(n).
+_SMC_REPLAY_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_SMC_REPLAY_CACHE_MAX = 32
+
+
+def _smc_series_key(high, low, close, swing_length: int) -> tuple:
+    """Identity of the series being replayed, not of one particular window."""
+    return (swing_length, float(high[0]), float(low[0]), float(close[0]))
+
+
+def _smc_bar_mark(high, low, close, index: int) -> tuple:
+    """Fingerprint of one bar, used to prove a cached prefix is still a prefix."""
+    return (float(high[index]), float(low[index]), float(close[index]))
+
+
 def _smc_replay(high, low, close, swing_length: int, size: int):
     """Bar-by-bar structure replay -- the single definition of BOS and CHoCH.
 
@@ -1094,20 +1102,65 @@ def _smc_replay(high, low, close, swing_length: int, size: int):
     Every SMC factor derives from this rather than repeating the loop, because
     a second copy would drift and the two would disagree about what the market
     structure is.
-    """
-    is_high, is_low = _smc_swings(high, low, swing_length)
 
-    events: list[tuple[int, int, float, int, int]] = []
-    level_high = float("nan")
-    level_low = float("nan")
-    pivot_high = -1
-    pivot_low = -1
-    high_live = False
-    low_live = False
-    direction = 0
+    Resumes from a cached state when the request extends a window already seen.
+    Two facts make that exact rather than merely fast:
+
+      * a pivot at i is decided by [i-n, i+n] alone, so indices already decided
+        cannot change when more bars arrive;
+      * the state after bar k depends only on bars up to k.
+
+    The cache is only trusted when the bar at the cached boundary still matches
+    the fingerprint recorded for it. A stale or unrelated series therefore falls
+    back to a full replay rather than silently continuing from the wrong state,
+    which would corrupt a backtest quietly -- the worst possible failure here.
+    Cached states are never mutated in place; each extension publishes a fresh
+    one, so a concurrent reader sees either the old or the new state whole.
+    """
+    key = _smc_series_key(high, low, close, swing_length)
+    cached = _SMC_REPLAY_CACHE.get(key)
+
+    resume_from = 0
+    if (
+        cached is not None
+        and 0 < cached["size"] <= size
+        and cached["mark"] == _smc_bar_mark(high, low, close, cached["size"] - 1)
+    ):
+        resume_from = cached["size"]
+        is_high = np.resize(cached["is_high"], size)
+        is_low = np.resize(cached["is_low"], size)
+        is_high[cached["size"]:] = False
+        is_low[cached["size"]:] = False
+        events = list(cached["events"])
+        level_high = cached["level_high"]
+        level_low = cached["level_low"]
+        pivot_high = cached["pivot_high"]
+        pivot_low = cached["pivot_low"]
+        high_live = cached["high_live"]
+        low_live = cached["low_live"]
+        direction = cached["direction"]
+    else:
+        is_high = np.zeros(size, dtype=bool)
+        is_low = np.zeros(size, dtype=bool)
+        events: list[tuple[int, int, float, int, int]] = []
+        level_high = float("nan")
+        level_low = float("nan")
+        pivot_high = -1
+        pivot_low = -1
+        high_live = False
+        low_live = False
+        direction = 0
+
+    # Decide the pivots that became decidable since the cached boundary. A
+    # pivot needs swing_length bars on each side, so index i is decidable once
+    # bar i + swing_length exists.
+    first_undecided = max(swing_length, resume_from - swing_length)
+    _smc_confirm_swings(high, low, swing_length, is_high, is_low,
+                        first_undecided, max(first_undecided, size - swing_length))
+
     last_event = (0, 0)          # (bos, choch) on the final bar
 
-    for index in range(size):
+    for index in range(resume_from, size):
         # The pivot at index - swing_length becomes knowable exactly now.
         pivot = index - swing_length
         if pivot >= 0:
@@ -1135,6 +1188,24 @@ def _smc_replay(high, low, close, swing_length: int, size: int):
                 1 if broke_up == 1 else (-1 if broke_down == 1 else 0),
                 1 if broke_up == 2 else (-1 if broke_down == 2 else 0),
             )
+
+    _SMC_REPLAY_CACHE[key] = {
+        "size": size,
+        "mark": _smc_bar_mark(high, low, close, size - 1),
+        "is_high": is_high,
+        "is_low": is_low,
+        "events": events,
+        "level_high": level_high,
+        "level_low": level_low,
+        "pivot_high": pivot_high,
+        "pivot_low": pivot_low,
+        "high_live": high_live,
+        "low_live": low_live,
+        "direction": direction,
+    }
+    _SMC_REPLAY_CACHE.move_to_end(key)
+    while len(_SMC_REPLAY_CACHE) > _SMC_REPLAY_CACHE_MAX:
+        _SMC_REPLAY_CACHE.popitem(last=False)
 
     return events, direction, level_high, level_low, last_event
 
@@ -1253,7 +1324,11 @@ def _smc_sweep(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     output = _choice(
         params, "output", {"side", "level", "extreme", "age"}, "side")
 
-    is_high, is_low = _smc_swings(high, low, swing_length)
+    # Reuse the replay's pivots rather than recomputing them; it already has
+    # them cached for this series and length.
+    _smc_replay(high, low, close, swing_length, size)
+    cached = _SMC_REPLAY_CACHE.get(_smc_series_key(high, low, close, swing_length))
+    is_high, is_low = cached["is_high"], cached["is_low"]
 
     # Walk back from the last bar; the first sweep found is the live one.
     start = max(swing_length, size - lookback)
