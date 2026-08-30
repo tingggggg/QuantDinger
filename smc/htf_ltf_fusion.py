@@ -63,18 +63,51 @@ TIMEFRAME PAIRING AND WHAT IT COSTS
   cutoff subtracts the READ frequency's own length, so an HTF bar only becomes
   visible on the LTF bar that completes it. Verified separately, 0 violations.
 
+WHERE THE DEFAULTS CAME FROM, AND WHAT THEY ARE WORTH
+  Chosen by a 72-config sweep over htf, ltf, trigger, reward_r and
+  trail_enabled, ranked by win rate, BTC 2023-10..2025-12, 1% risk per trade.
+  Configurations under 15 trades were excluded: without that guard the winner
+  was a 3-trade run at 66.7%, which measures nothing.
+
+  Ranking by WIN RATE is not the same as ranking by profitability, and the
+  sweep shows it directly. Mean win rate against mean profit factor:
+
+    reward_r 1.0   win 49.3%   PF 1.17     <- best win rate, worst PF
+    reward_r 2.0   win 44.6%   PF 1.32
+    reward_r 3.0   win 39.8%   PF 1.30
+
+  A near target is easy to hit and pays little. reward_r defaults to 1.0
+  because that is what the stated objective selects, not because it is the
+  most profitable setting -- reward_r 2.0 keeps a better PF at a lower win
+  rate, and is the better default if the objective is return.
+
+  The top two configurations tied at 60.9% and 60.7%, a gap smaller than one
+  trade. The tie went to trail_enabled=1, which wins on every other axis:
+  PF 1.50 vs 1.30, return 3.79% vs 2.95%, drawdown -3.09% vs -3.53%, and 28
+  trades against 23.
+
+  These defaults do NOT survive a split, and should not be read as validated:
+
+    first half  2023-10..2024-11   win 70.6%   PF 2.21   n=17
+    second half 2024-11..2025-12   win 45.5%   PF 0.94   n=11
+
+  Milder than the reward_r=3.0 arm, which went PF 3.45 to 0.67, because a win
+  rate near a coin flip is less sensitive to regime than a 3R target is. Still
+  a losing second half. They are the best of 72 arms on one sample, which is
+  a description of this window, not evidence of an edge.
+
 BACKTEST RANGE ON CRYPTO
   Crypto falls back to the 1D default of 1095 days and the 120-bar warmup on
   the daily frequency costs 227 of them, leaving roughly 868 usable.
 """
 
-# @param htf_timeframe str 1d Higher timeframe that sets direction and zones values=4h,1d
+# @param htf_timeframe str 4h Higher timeframe that sets direction and zones values=4h,1d
 # @param ltf_timeframe str 1h Lower timeframe that confirms entry values=1h,4h
-# @param trigger int 0 0 = sweep then CHoCH, 1 = inversion gap, 2 = either range=0:2:1
+# @param trigger int 1 0 = sweep then CHoCH, 1 = inversion gap, 2 = either range=0:2:1
 # @param swing_length int 10 Bars each side to confirm a swing range=4:24:1
 # @param zone_max_age int 40 Ignore HTF zones older than this many HTF bars range=3:120:1
 # @param arm_bars int 12 LTF bars the trigger stays armed after price enters the zone range=2:60:1
-# @param reward_r float 3.0 Target as a multiple of risk range=0.5:8:0.25
+# @param reward_r float 1.0 Target as a multiple of risk range=0.5:8:0.25
 # @param risk_pct float 0.01 Equity risked per trade -- source says 1% to 3% range=0.005:0.03:0.005
 # @param sweep_window int 10 LTF bars the sweep stays valid for range=2:40:1
 # @param trail_enabled int 1 Move the stop up to each new LTF swing low range=0:1:1
@@ -116,13 +149,13 @@ def handle_data(context, data):
 
 
 def _decide(context, data):
-    htf = str(context.params.get("htf_timeframe", "1d"))
+    htf = str(context.params.get("htf_timeframe", "4h"))
     ltf = str(context.params.get("ltf_timeframe", "1h"))
-    trigger = int(context.params.get("trigger", 0))
+    trigger = int(context.params.get("trigger", 1))
     swing_length = int(context.params.get("swing_length", 10))
     zone_max_age = int(context.params.get("zone_max_age", 40))
     arm_bars = int(context.params.get("arm_bars", 12))
-    reward_r = float(context.params.get("reward_r", 3.0))
+    reward_r = float(context.params.get("reward_r", 1.0))
     risk_pct = float(context.params.get("risk_pct", 0.01))
     sweep_window = int(context.params.get("sweep_window", 10))
     trail_enabled = int(context.params.get("trail_enabled", 1))
