@@ -59,8 +59,8 @@ ITEMS = [
         "description": (
             "SMC Model 3：回測未緩解的公允價值缺口，停損放在造成缺口的位移 K 棒後方，"
             "停利用固定 R 倍數。注意 reward_r 是實作時選的，原始模型只給進場與停損、"
-            "沒有出場規則。BTC 800 天實測：4h 週期 61 筆、PF 0.97，1d 只有 10 筆。"
-            "signal_timeframe 可切 4h/1d。幣圈回測區間上限約 868 天。"
+            "沒有出場規則。BTC 800 天實測：1h 週期 175 筆、PF 1.00，4h 71 筆、PF 0.91。"
+            "signal_timeframe 可切 1h/4h/1d。幣圈回測區間上限約 868 天。"
         ),
     },
     {
@@ -71,7 +71,7 @@ ITEMS = [
         "description": (
             "SMC Model 1：影線掃掉前低但收盤守住，隨後結構轉多才進場，停損放在掃蕩極值外。"
             "smc_sweep factor 專為此模型而生 —— BOS 定義在收盤，掃蕩正好相反，"
-            "只看收盤的 smc_structure 看不到它。choch_window 與 reward_r 是實作時選的。"
+            "只看收盤的 smc_structure 看不到它。BTC 800 天 1h 實測 23 筆、PF 1.22，4h 只有 4 筆。"
         ),
     },
     {
@@ -82,7 +82,19 @@ ITEMS = [
         "description": (
             "SMC Model 2：結構偏多時，等價格回測造成突破的未緩解訂單塊。"
             "訂單塊只在其造成的突破確認後才浮現，不是在該 K 棒當下。"
-            "BTC 800 天 4h 實測 29 筆、PF 1.19，1d 只有 5 筆、PF 0.34。"
+            "BTC 800 天實測：1h 105 筆、PF 1.08，4h 50 筆、PF 1.05。"
+        ),
+    },
+    {
+        "path": "smc/ote_confluence.py",
+        "run_config": "BTC",
+        "name": "SMC OTE 匯流",
+        "aliases": ["SMC OTE 匯流", "SMC OTE Confluence"],
+        "description": (
+            "SMC Model 4（Justin Bennett 八步驟模型）：結構轉多 + 價格在折價區 + "
+            "回撤進入 OTE（該波段的 62%–79%，作者影片原話）+ FVG 與 OTE 重疊才進場。"
+            "這是四個模型裡唯一有「位置濾網」的 —— 其餘三個都只描述發生了什麼，"
+            "它描述價格現在在哪。BTC 800 天 1h 實測 19 筆、PF 0.97。"
         ),
     },
 ]

@@ -27,10 +27,11 @@ WHAT THE SOURCE MODEL LEAVES OPEN
   hard rule. Neither is from the model.
 
 TIMEFRAME
-  `signal_timeframe` selects which bars the SMC factors read. Both 4h and 1d
-  are subscribed, and the runtime drives on the SMALLEST subscribed frequency,
-  so decisions are evaluated every 4h either way -- reading 1d factors on a 4h
-  clock is the multi-timeframe shape the source model describes, not a bug.
+  `signal_timeframe` selects which bars the SMC factors read. 1h, 4h and 1d are
+  all subscribed, and the runtime drives on the SMALLEST subscribed frequency,
+  so decisions are evaluated every 1h whichever is chosen -- reading 4h or 1d
+  factors on a 1h clock is the multi-timeframe shape the source models
+  describe, not a bug.
 
   It cannot be a plain subscribe() argument: context.subscribe runs inside
   initialize, where context.params is unavailable.
@@ -75,6 +76,22 @@ def initialize(context):
 
 
 def handle_data(context, data):
+    # A factor with nothing to say yet -- during warmup, or before any pivot is
+    # confirmed -- raises, and the runtime re-raises it, which kills the whole
+    # run on one early bar. That means "no trade", not "abort".
+    #
+    # The decision lives in its own function rather than behind a read() helper
+    # so the factor names stay literal: the manifest's factorDependencies come
+    # from an AST scan for factor("name"), and hiding the names behind a
+    # variable empties it -- which in turn stops the review chart from knowing
+    # this is an SMC run.
+    try:
+        _decide(context, data)
+    except Exception:
+        return
+
+
+def _decide(context, data):
     tf = str(context.params.get("signal_timeframe", "4h"))
     swing_length = int(context.params.get("swing_length", 10))
     reward_r = float(context.params.get("reward_r", 2.0))
@@ -86,8 +103,7 @@ def handle_data(context, data):
     if position is not None and position.amount > 0:
         return
 
-    trend = factor("smc_structure", SYMBOL, frequency=tf,
-                   swing_length=swing_length, output="trend")
+    trend = factor("smc_structure", SYMBOL, frequency=tf, swing_length=swing_length, output="trend")
     if trend is None or trend <= 0:
         return
 

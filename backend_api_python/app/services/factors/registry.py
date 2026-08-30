@@ -71,7 +71,7 @@ def _technical_warmup(factor_id: str, params: Mapping[str, Any]) -> int:
         return int(params.get("slow_period") or 10)
     if factor_id in {"obv", "ad_line"}:
         return period + 1
-    if factor_id in {"smc_structure", "smc_fvg", "smc_sweep", "smc_ob"}:
+    if factor_id in {"smc_structure", "smc_fvg", "smc_sweep", "smc_ob", "smc_ote"}:
         # A pivot needs swing_length bars on each side, plus a bar for the
         # break to land on. Below this the structure is not yet defined.
         return int(params.get("swing_length") or 10) * 2 + 2
@@ -116,6 +116,8 @@ _OUTPUT_OPTIONS = {
     "obv": ("value", "slope"),
     "smc_fvg": ("side", "top", "bottom", "distance", "stop", "age"),
     "smc_ob": ("side", "top", "bottom", "stop", "distance", "age"),
+    "smc_ote": ("position", "retrace", "in_ote", "discount", "premium",
+                "ote_near", "ote_far", "leg_low", "leg_high"),
     "smc_structure": ("trend", "bos", "choch", "swing_high", "swing_low",
                       "distance_high", "distance_low"),
     "smc_sweep": ("side", "level", "extreme", "age"),
@@ -225,6 +227,7 @@ _FACTORS = {
         _technical("smc_fvg", "trend", ("high", "low", "close"), {"output": "side"}, "higher_is_bullish", lambda f, p: _smc_fvg(f, p)),
         _technical("smc_sweep", "trend", ("high", "low", "close"), {"swing_length": 10, "lookback": 60, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_sweep(f, p)),
         _technical("smc_ob", "trend", ("open", "high", "low", "close"), {"swing_length": 10, "search": 30, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_ob(f, p)),
+        _technical("smc_ote", "trend", ("high", "low", "close"), {"swing_length": 10, "ote_from": 0.62, "ote_to": 0.79, "output": "in_ote"}, "neutral", lambda f, p: _smc_ote(f, p)),
         _fundamental("market_cap", "size", ("market_cap",), "lower_is_bullish", lambda f, p: _last_value(f, "market_cap")),
         _fundamental("earnings_yield", "valuation", ("net_income", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "net_income", "market_cap")),
         _fundamental("book_to_price", "valuation", ("book_value", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "book_value", "market_cap")),
@@ -1441,3 +1444,89 @@ def _smc_ob(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     if output == "side":
         return 0.0
     raise FactorError("factor.noData")
+
+
+def _smc_ote(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
+    """Where price sits inside the most recent completed swing leg.
+
+    Model 4's position filter, and the one thing the other three models have no
+    equivalent of: structure, gaps and blocks all say *what* happened, this says
+    *where price is now* relative to it. A setup can be structurally perfect and
+    still be a bad entry because price has not retraced far enough.
+
+    The leg runs between the two most recent confirmed pivots of opposite kind,
+    so it inherits the swing confirmation delay and cannot look ahead.
+
+      position   0 at the leg's origin, 1 at its extreme
+      retrace    how far price has pulled back from the extreme, 0 to 1
+      in_ote     1 when retrace is inside the optimal-trade-entry band
+      discount   1 when price is below the midpoint of the leg
+      premium    1 when above it
+      ote_near   the shallower edge of the band, as a price
+      ote_far    the deeper edge, as a price
+      leg_low / leg_high   the anchors
+
+    The band defaults to 0.62-0.79, the figures the source states verbatim
+    ("this is a 62% to 79% of this recent move"). They are parameters because
+    they are a convention, not a derivation.
+    """
+    swing_length, size, high, low, close = _smc_bars(frame, params)
+    lower = _positive_float(params, "ote_from", 0.62)
+    upper = _positive_float(params, "ote_to", 0.79)
+    if not 0 < lower < upper < 1:
+        raise FactorError("factor.badParams")
+    output = _choice(
+        params, "output",
+        {"position", "retrace", "in_ote", "discount", "premium",
+         "ote_near", "ote_far", "leg_low", "leg_high"},
+        "in_ote",
+    )
+
+    _smc_replay(high, low, close, swing_length, size)
+    cached = _SMC_REPLAY_CACHE.get(_smc_series_key(high, low, close, swing_length))
+    is_high, is_low = cached["is_high"], cached["is_low"]
+
+    # Only pivots already confirmed at the last bar may anchor the leg.
+    usable = size - 1 - swing_length
+    if usable < 0:
+        raise FactorError("factor.insufficientHistory")
+    highs = [i for i in range(usable + 1) if is_high[i]]
+    lows = [i for i in range(usable + 1) if is_low[i]]
+    if not highs or not lows:
+        raise FactorError("factor.noData")
+
+    high_index, low_index = highs[-1], lows[-1]
+    leg_high = float(high[high_index])
+    leg_low = float(low[low_index])
+    span = leg_high - leg_low
+    if span <= 0:
+        raise FactorError("factor.noData")
+
+    # Direction of the leg: which extreme came last.
+    rising = high_index > low_index
+    last_close = float(close[-1])
+
+    position = (last_close - leg_low) / span
+    # Retracement is measured back from whichever extreme completed the leg.
+    retrace = (leg_high - last_close) / span if rising else (last_close - leg_low) / span
+
+    if output == "position":
+        return float(position)
+    if output == "retrace":
+        return float(retrace)
+    if output == "in_ote":
+        return 1.0 if lower <= retrace <= upper else 0.0
+    if output == "discount":
+        return 1.0 if position < 0.5 else 0.0
+    if output == "premium":
+        return 1.0 if position > 0.5 else 0.0
+    if output == "leg_low":
+        return leg_low
+    if output == "leg_high":
+        return leg_high
+    # Band edges as prices, oriented so `near` is the shallower retracement.
+    if rising:
+        near, far = leg_high - span * lower, leg_high - span * upper
+    else:
+        near, far = leg_low + span * lower, leg_low + span * upper
+    return float(near if output == "ote_near" else far)
