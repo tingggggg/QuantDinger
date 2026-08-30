@@ -97,6 +97,24 @@ ITEMS = [
             "它描述價格現在在哪。BTC 800 天 1h 實測 19 筆、PF 0.97。"
         ),
     },
+    {
+        "path": "smc/htf_ltf_fusion.py",
+        "run_config": "BTC",
+        "name": "SMC 高低週期融合",
+        "aliases": ["SMC 高低週期融合", "SMC HTF/LTF Fusion"],
+        "description": (
+            "SMC Model 5：唯一真正雙週期的模型 —— 高週期決定「在哪」（趨勢 + 訂單塊供需區），"
+            "低週期決定「何時」（掃蕩後結構轉多，或反轉 FVG）。兩者可以相隔多根 K 棒，"
+            "靠狀態機串起來，這是它跟 Model 1~4 的根本差別。"
+            "風險固定為權益的 risk_pct，部位大小由停損距離換算。"
+            "注意：結構移動停損是策略端自己做的，只看收盤 —— 引擎的 protection 只能表達"
+            "「均價的百分比」，無法表達會移動的絕對價位。"
+            "BTC 800 天實測最佳組合（HTF=4h／LTF=1h／trigger=1 反轉 FVG）全期 PF 1.76、26 筆，"
+            "但切成前後半後是 PF 3.45 對 PF 0.67 —— 優勢沒有撐過樣本分割，不要當成可用策略。"
+            "唯一穩健的發現是 HTF 濾網有效：放寬後 PF 由 1.76 掉到 1.17。"
+            "trigger=0（掃蕩→結構轉多）樣本過少（5 筆）無法評估。"
+        ),
+    },
 ]
 
 def run_config(market: str, symbol: str) -> dict:

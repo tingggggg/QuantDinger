@@ -71,6 +71,10 @@ def _technical_warmup(factor_id: str, params: Mapping[str, Any]) -> int:
         return int(params.get("slow_period") or 10)
     if factor_id in {"obv", "ad_line"}:
         return period + 1
+    if factor_id == "smc_ifvg":
+        # No pivots involved: a gap needs three bars and the inversion needs
+        # somewhere to happen, so the scan window is the whole requirement.
+        return max(4, int(params.get("lookback") or 60)) + 3
     if factor_id in {"smc_structure", "smc_fvg", "smc_sweep", "smc_ob", "smc_ote"}:
         # A pivot needs swing_length bars on each side, plus a bar for the
         # break to land on. Below this the structure is not yet defined.
@@ -115,6 +119,7 @@ _OUTPUT_OPTIONS = {
     "macd": ("line", "signal", "histogram"),
     "obv": ("value", "slope"),
     "smc_fvg": ("side", "top", "bottom", "distance", "stop", "age"),
+    "smc_ifvg": ("side", "top", "bottom", "stop", "distance", "age"),
     "smc_ob": ("side", "top", "bottom", "stop", "distance", "age"),
     "smc_ote": ("position", "retrace", "in_ote", "discount", "premium",
                 "ote_near", "ote_far", "leg_low", "leg_high"),
@@ -225,6 +230,7 @@ _FACTORS = {
         _technical("amihud_illiquidity", "liquidity", ("close", "volume"), {"period": 20}, "lower_is_bullish", lambda f, p: _amihud_illiquidity(f, p)),
         _technical("smc_structure", "trend", ("high", "low", "close"), {"swing_length": 10, "output": "trend"}, "higher_is_bullish", lambda f, p: _smc_structure(f, p)),
         _technical("smc_fvg", "trend", ("high", "low", "close"), {"output": "side"}, "higher_is_bullish", lambda f, p: _smc_fvg(f, p)),
+        _technical("smc_ifvg", "trend", ("high", "low", "close"), {"lookback": 60, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_ifvg(f, p)),
         _technical("smc_sweep", "trend", ("high", "low", "close"), {"swing_length": 10, "lookback": 60, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_sweep(f, p)),
         _technical("smc_ob", "trend", ("open", "high", "low", "close"), {"swing_length": 10, "search": 30, "output": "side"}, "higher_is_bullish", lambda f, p: _smc_ob(f, p)),
         _technical("smc_ote", "trend", ("high", "low", "close"), {"swing_length": 10, "ote_from": 0.62, "ote_to": 0.79, "output": "in_ote"}, "neutral", lambda f, p: _smc_ote(f, p)),
@@ -1303,6 +1309,113 @@ def _smc_fvg(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     if output == "side":
         return 0.0
     raise FactorError("factor.noData")
+
+
+def _smc_ifvg(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
+    """Most recent live inversion gap -- a fair value gap price closed through,
+    so its polarity flipped.
+
+    smc_fvg reports the most recent gap price has NOT traded back through. This
+    reports exactly the set that one discards: a gap price went through
+    decisively, on the reasoning that a level which failed as resistance tends
+    to act as support. A bearish gap the market closes above stops being a
+    ceiling and becomes a floor.
+
+    It is the second entry trigger in the HTF/LTF model, standing for "momentum
+    changed hands inside the zone". smc_fvg cannot express it -- it stops at
+    the first unmitigated gap, which is the complement of this set.
+
+    Knowable on the bar whose CLOSE completes the inversion: the gap was
+    defined three bars back, and the break is this bar's own close. Both the
+    inversion and its later invalidation are close-based, so nothing here
+    depends on a bar that has not finished.
+
+      side      1 = bullish inversion (was a bearish gap, now support)
+               -1 = bearish inversion (was a bullish gap, now resistance)
+      top       upper edge of the flipped zone
+      bottom    lower edge
+      stop      the extreme the formation made between the gap and the break,
+                which is the level the model puts a stop outside of
+      age       bars since the inversion closed
+      distance  last close against the zone midpoint
+    """
+    size = len(frame)
+    if size < 4:
+        raise FactorError("factor.insufficientHistory")
+
+    high = pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float)
+    output = _choice(
+        params, "output", {"side", "top", "bottom", "stop", "distance", "age"},
+        "side")
+    # Bounded so the cost per bar stays flat. An inversion this old is not the
+    # "momentum just changed" the model is about, and an unbounded scan would
+    # make the factor quadratic on every call.
+    lookback = max(4, int(params.get("lookback") or 60))
+    start = max(2, size - lookback)
+
+    best_index = -1
+    best: tuple[float, float, float, float] | None = None
+    for k in range(start, size):
+        previous_high, previous_low = high[k - 2], low[k - 2]
+        if low[k] > previous_high:
+            top, bottom, original = low[k], previous_high, 1
+        elif high[k] < previous_low:
+            top, bottom, original = previous_low, high[k], -1
+        else:
+            continue
+
+        later = close[k + 1:]
+        if later.size == 0:
+            continue
+        # Through the gap, against the side it was drawn on.
+        broken = later < bottom if original == 1 else later > top
+        if not broken.any():
+            continue
+        index = k + 1 + int(np.argmax(broken))
+        if index < best_index:
+            # An older gap cannot beat an inversion that already happened later.
+            continue
+        # On a tie the later gap wins: one decisive close can invert several
+        # stacked gaps at once, and the freshest is the tightest zone and the
+        # nearest stop. Without an explicit rule here the winner would be
+        # whichever gap the scan happened to reach first, which is the oldest
+        # and widest -- and it would change as older ones were invalidated.
+
+        after = close[index + 1:]
+        if after.size:
+            # Still live only while price has not closed back through the far
+            # side. An inversion that failed is not a level, it is history.
+            failed = after < bottom if original == -1 else after > top
+            if failed.any():
+                continue
+
+        extreme = (float(np.min(low[k - 2:index + 1])) if original == -1
+                   else float(np.max(high[k - 2:index + 1])))
+        best_index, best = index, (float(-original), top, bottom, extreme)
+
+    if best is None:
+        if output == "side":
+            return 0.0
+        raise FactorError("factor.noData")
+
+    side, top, bottom, extreme = best
+    if output == "side":
+        return side
+    if output == "top":
+        return float(top)
+    if output == "bottom":
+        return float(bottom)
+    if output == "stop":
+        return extreme
+    if output == "age":
+        return float(size - 1 - best_index)
+    middle = (top + bottom) / 2.0
+    last_close = close[-1]
+    if not middle or not last_close:
+        raise FactorError("factor.noData")
+    return float((last_close - middle) / middle)
 
 
 def _smc_sweep(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
