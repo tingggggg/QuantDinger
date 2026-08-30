@@ -102,6 +102,10 @@ def _prepare_run(payload: dict[str, Any], user_id: int) -> dict[str, Any]:
         "commission": parse_rate(payload.get("commission"), default=default_commission_if_missing(None)),
         "slippage": parse_rate(payload.get("slippage"), default=default_slippage_if_missing(None)),
         "params": dict(payload.get("params") or {}),
+        # Empty means "use whatever the strategy declared". Only pool-driven
+        # strategies accept an override; anything else is rejected rather than
+        # silently ignored.
+        "universe": str(payload.get("universe") or "").strip(),
         "strategy_id": strategy_id,
         "source_id": source_id,
         "strategy_name": strategy_name,

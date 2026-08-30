@@ -255,6 +255,60 @@ class UniverseService:
             ],
         }
 
+    def rename_universe(self, user_id: int, universe_id: int, name: str) -> dict:
+        """Relabel one of the caller's own lists.
+
+        `code` is deliberately left alone. It is what a strategy names in
+        set_universe(pool=...), so regenerating it from the new name would
+        silently break every strategy pointing at the list -- they would fail
+        with universeNotFound at run time, long after the rename. The code is a
+        slug plus a uuid suffix and was never meant to be read; the name is the
+        part that is allowed to change.
+        """
+        clean = str(name or "").strip()
+        if not clean or len(clean) > 160:
+            raise UniverseError("universe.invalidName")
+        with get_db_connection() as db:
+            universe = self._get_visible_universe(db, user_id, universe_id, require_owner=True)
+            if universe.get("universe_type") not in EDITABLE_UNIVERSE_TYPES:
+                raise UniverseError("universe.readOnly", status_code=409)
+            cur = db.cursor()
+            cur.execute(
+                "UPDATE qd_universes SET name = ?, updated_at = NOW() WHERE id = ?",
+                (clean, int(universe_id)),
+            )
+            db.commit()
+            cur.close()
+        return self.get_universe(user_id, universe_id)
+
+    def delete_universe(self, user_id: int, universe_id: int) -> dict:
+        """Retire one of the caller's own lists.
+
+        Deliberately a soft delete. list_universes already filters
+        `status <> 'deprecated'`, which is the mechanism the schema was built
+        for, and a hard DELETE would cascade qd_universe_members and
+        qd_universe_snapshots away with it -- taking the membership history that
+        past backtests were actually run against. A stored run that recorded
+        universe_id 46 should still be able to answer what 46 held on the day it
+        ran.
+
+        A retired list disappears from the picker and stops resolving, so a
+        strategy still naming it fails at run time rather than quietly running
+        against an empty universe.
+        """
+        with get_db_connection() as db:
+            universe = self._get_visible_universe(db, user_id, universe_id, require_owner=True)
+            if universe.get("universe_type") not in EDITABLE_UNIVERSE_TYPES:
+                raise UniverseError("universe.readOnly", status_code=409)
+            cur = db.cursor()
+            cur.execute(
+                "UPDATE qd_universes SET status = 'deprecated', updated_at = NOW() WHERE id = ?",
+                (int(universe_id),),
+            )
+            db.commit()
+            cur.close()
+        return {"universe_id": int(universe_id), "status": "deprecated"}
+
     def replace_manual_members(self, user_id: int, universe_id: int, raw_members: list) -> list[dict]:
         with get_db_connection() as db:
             universe = self._get_visible_universe(db, user_id, universe_id, require_owner=True)

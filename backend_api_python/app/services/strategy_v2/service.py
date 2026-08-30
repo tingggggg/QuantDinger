@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -20,6 +21,7 @@ from app.services.universe import UniverseService, get_universe_service
 
 from .contract import StrategyV2ContractError, compile_strategy_v2
 from .factor_research import FactorResearchEngine
+from .instruments import normalize_pool_reference
 from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
@@ -137,9 +139,16 @@ class StrategyV2BacktestService:
         strategy_id: int | None = None,
         source_id: int | None = None,
         strategy_name: str = "",
+        universe: str = "",
     ) -> tuple[int | None, dict[str, Any]]:
         program = compile_strategy_v2(code)
         manifest = program.manifest
+        if universe:
+            manifest = _override_universe(manifest, universe)
+            # Recorded as a run parameter so the history and the run-comparison
+            # view can say which list produced which number. Without this the
+            # only trace is manifest_json, which the comparison does not read.
+            params = {**(params or {}), "universe": manifest.universe.reference}
         if end_date <= start_date:
             raise StrategyV2ContractError("strategyV2.invalidDateRange")
         if initial_capital <= 0:
@@ -618,6 +627,41 @@ def _member_key(member: dict[str, Any]) -> str:
         instrument_id=str(member.get("instrument_id") or ""),
     )
     return item.key
+
+
+def _override_universe(manifest: StrategyManifest, reference: str) -> StrategyManifest:
+    """Point a pool-driven strategy at a different list for this one run.
+
+    set_universe(pool=...) is called inside initialize, and reading
+    context.params there is a compile-time rejection
+    (strategyV2.initializeParamsUnavailable) -- the manifest is the contract
+    that also drives live deployment, so it cannot depend on per-run values.
+    That leaves the pool hardcoded in the source, and comparing one strategy
+    across two lists means editing the code between runs, which changes the
+    code hash and leaves the run history unable to say which list produced
+    which number. Overriding the compiled manifest keeps the source fixed and
+    makes the list a recorded run input instead.
+
+    Only strategies that already declare a reference are redirected. One that
+    names its instruments outright is making a different claim, and swapping
+    its universe underneath would change what the strategy is rather than what
+    it ran against.
+    """
+    if manifest.universe.kind != "dynamic" or not manifest.universe.reference:
+        raise StrategyV2ContractError("strategyV2.universeOverrideNotPoolBased")
+    target = normalize_pool_reference(reference)
+    return replace(
+        manifest,
+        universe=replace(manifest.universe, reference=target),
+        # Subscriptions carry the reference too. The backtest path fetches from
+        # the resolved candidates rather than from these, so this does not
+        # change what is loaded -- it keeps the stored manifest_json honest
+        # about which list the run actually used.
+        subscriptions=tuple(
+            replace(item, universe_reference=target) if item.universe_reference else item
+            for item in manifest.subscriptions
+        ),
+    )
 
 
 def _universe_matches(item: dict[str, Any], reference: str) -> bool:
