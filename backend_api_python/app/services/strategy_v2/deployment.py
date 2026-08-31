@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from app.services.script_source import get_script_source_service
+from app.services.live_trading.capabilities import supported_crypto_exchange_ids
 from app.services.strategy_direction import (
     direction_mode_position_side,
     normalize_direction_mode,
@@ -23,6 +24,14 @@ class StrategyV2DeploymentService:
             raise StrategyV2ContractError("strategyV2.sourceNotFound")
         program = compile_strategy_v2(str(source.get("code") or ""))
         manifest = program.manifest
+        source_metadata = self._object(source.get("metadata"))
+        adaptation = self._object(source_metadata.get("marketplace_adaptation"))
+        if adaptation.get("requires_backtest") and not self._has_current_version_backtest(
+            user_id=int(user_id),
+            source_id=source_id,
+            code_hash=str(manifest.code_hash or ""),
+        ):
+            raise StrategyV2ContractError("strategyV2.backtestRequiredForAdaptedStrategy")
         name = str(payload.get("name") or source.get("name") or "").strip()
         if not name:
             raise StrategyV2ContractError("strategyV2.nameRequired")
@@ -75,7 +84,6 @@ class StrategyV2DeploymentService:
             "channels": list(payload.get("notificationChannels") or []),
             "targets": payload.get("notificationTargets") or {},
         }
-        source_metadata = self._object(source.get("metadata"))
         source_runtime = self._object(source_metadata.get("last_run_config"))
         generated_runtime = payload.get("strategyRuntimeConfig") or payload.get("strategy_runtime_config") or {}
         if not isinstance(generated_runtime, dict):
@@ -246,6 +254,24 @@ class StrategyV2DeploymentService:
         return str(row.get("exchange_id") or "").strip().lower()
 
     @staticmethod
+    def _has_current_version_backtest(*, user_id: int, source_id: int, code_hash: str) -> bool:
+        if not source_id or not code_hash:
+            return False
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id FROM qd_backtest_runs
+                WHERE user_id = ? AND source_id = ? AND code_hash = ? AND status = 'success'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (int(user_id), int(source_id), str(code_hash)),
+            )
+            found = cur.fetchone() is not None
+            cur.close()
+        return found
+
+    @staticmethod
     def _validate_execution_account(markets: tuple[str, ...], exchange_id: str, execution_mode: str) -> None:
         if execution_mode != "live":
             return
@@ -253,7 +279,7 @@ class StrategyV2DeploymentService:
         if len(market_set) != 1:
             raise StrategyV2ContractError("strategyV2.mixedMarketLiveUnsupported")
         market = next(iter(market_set), "")
-        if market == "Crypto" and exchange_id not in {"binance", "bitget", "bybit", "okx", "gate", "htx"}:
+        if market == "Crypto" and exchange_id not in supported_crypto_exchange_ids():
             raise StrategyV2ContractError("strategyV2.cryptoCredentialRequired")
         if market == "USStock" and exchange_id not in {"alpaca", "ibkr"}:
             raise StrategyV2ContractError("strategyV2.stockCredentialRequired")

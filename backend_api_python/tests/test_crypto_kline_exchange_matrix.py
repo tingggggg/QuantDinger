@@ -51,6 +51,20 @@ def test_public_kline_exchange_list_is_stable():
     )
 
 
+def test_unscoped_public_kline_defaults_to_okx(monkeypatch):
+    captured = {}
+    monkeypatch.delenv("CRYPTO_PUBLIC_KLINE_PRIMARY", raising=False)
+    monkeypatch.setattr(
+        CryptoDataSource,
+        "_init_ccxt_exchange",
+        lambda self, exchange_id, options: captured.update(exchange_id=exchange_id, options=options),
+    )
+
+    CryptoDataSource()
+
+    assert captured["exchange_id"] == "okx"
+
+
 def test_swap_symbol_uses_settlement_suffix():
     source = object.__new__(CryptoDataSource)
     source._scoped_market_type = "swap"
@@ -61,7 +75,33 @@ def test_swap_symbol_uses_settlement_suffix():
     assert source._symbol_for_scoped_market("BTC/USDT") == "BTC/USDT:USDT"
 
 
-def test_gate_long_range_fetch_is_clamped_to_recent_candle_limit():
+def test_crypto_kline_is_pure_ohlcv_and_preserves_price_precision():
+    now_s = int(datetime.now(timezone.utc).timestamp())
+    source = object.__new__(CryptoDataSource)
+    source._allow_public_fallback = False
+    source._preferred_public_exchange_id = ""
+    source._scoped_market_type = "swap"
+    source.exchange = SimpleNamespace(id="binanceusdm", timeframes={"1m": "1m"})
+    source._markets_loaded = False
+    source._markets_cache = None
+    source._fetch_ohlcv = lambda *_args, **_kwargs: [
+        [now_s * 1000, "0.01038", "0.010381", "0.010379", "0.01038", "12.3456"],
+    ]
+    source.log_result = lambda *_args, **_kwargs: None
+
+    rows = source.get_kline("TUT/USDT", "1m", 1)
+
+    assert rows == [{
+        "time": now_s,
+        "open": 0.01038,
+        "high": 0.010381,
+        "low": 0.010379,
+        "close": 0.01038,
+        "volume": 12.35,
+    }]
+
+
+def test_gate_long_range_fetch_refuses_partial_recent_candle_window():
     now_s = int(datetime.now(timezone.utc).timestamp())
     requested_since_s = now_s - 30 * 24 * 60 * 60
     calls = []
@@ -82,13 +122,11 @@ def test_gate_long_range_fetch_is_clamped_to_recent_candle_limit():
         requested_since_s,
     )
 
-    assert rows
-    assert calls
-    earliest_supported_ms = now_s * 1000 - (10000 - 1) * 60 * 1000
-    assert calls[0]["since"] >= earliest_supported_ms
+    assert rows == []
+    assert calls == []
 
 
-def test_any_exchange_falls_back_to_recent_candles_when_requested_window_is_rejected():
+def test_historical_window_is_not_replaced_with_recent_candles():
     now_s = int(datetime.now(timezone.utc).timestamp())
     calls = []
 
@@ -110,8 +148,9 @@ def test_any_exchange_falls_back_to_recent_candles_when_requested_window_is_reje
         now_s - 30 * 24 * 60 * 60,
     )
 
-    assert rows
-    assert calls[-1] is None
+    assert rows == []
+    assert calls
+    assert None not in calls
 
 
 def test_unscoped_crypto_kline_falls_back_to_another_public_exchange(monkeypatch):
@@ -149,7 +188,7 @@ def test_unscoped_crypto_kline_falls_back_to_another_public_exchange(monkeypatch
     rows = source.get_kline("BTC/USDT", "1H", 10)
 
     assert rows == expected
-    assert attempts == [("bitget", "spot")]
+    assert attempts == [("okx", "spot")]
 
 
 def test_unscoped_swap_kline_fallback_preserves_market_type(monkeypatch):
@@ -188,7 +227,7 @@ def test_unscoped_swap_kline_fallback_preserves_market_type(monkeypatch):
     rows = source.get_kline("BTC/USDT", "1m", 10)
 
     assert rows == expected
-    assert attempts == [("bitget", "swap")]
+    assert attempts == [("okx", "swap")]
 
 
 def test_public_kline_reuses_successful_fallback_without_retrying_failed_primary(monkeypatch):
@@ -229,7 +268,7 @@ def test_public_kline_reuses_successful_fallback_without_retrying_failed_primary
     assert source.get_kline("BTC/USDT", "4H", 10) == expected
     assert source.get_kline("BTC/USDT", "4H", 10) == expected
     assert primary_attempts == [True]
-    assert fallback_attempts == [("bitget", "swap"), ("bitget", "swap")]
+    assert fallback_attempts == [("okx", "swap"), ("okx", "swap")]
 
 
 def test_public_ticker_reuses_kline_promoted_provider(monkeypatch):

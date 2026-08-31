@@ -11,12 +11,14 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from app.data_sources.errors import MarketDataUnavailableError
 from app.services.backtest_limits import (
     BacktestRangeLimitError,
     backtest_warmup_calendar_days,
     validate_backtest_range,
 )
 from app.services.fundamental_data import get_fundamental_data_service
+from app.services.instrument_rules import InstrumentRulesProvider, get_instrument_rules_provider
 from app.services.universe import UniverseService, get_universe_service
 
 from .contract import StrategyV2ContractError, compile_strategy_v2
@@ -40,6 +42,7 @@ class StrategyV2BacktestService:
         data_kind: str = "market",
         data_source: str = "system_market_data_router",
         snapshot_store: MarketDataSnapshotStore | None = None,
+        instrument_rules_provider: InstrumentRulesProvider | None = None,
     ) -> None:
         self.repository = repository or StrategyBacktestRepository()
         self.universe_service = universe_service or get_universe_service()
@@ -48,6 +51,7 @@ class StrategyV2BacktestService:
         self.data_kind = str(data_kind or "market")
         self.data_source = str(data_source or "system_market_data_router")
         self.snapshot_store = snapshot_store or MarketDataSnapshotStore()
+        self.instrument_rules_provider = instrument_rules_provider or get_instrument_rules_provider()
 
     def compile(self, code: str) -> dict[str, Any]:
         return compile_strategy_v2(code).manifest.metadata()
@@ -140,6 +144,7 @@ class StrategyV2BacktestService:
         source_id: int | None = None,
         strategy_name: str = "",
         universe: str = "",
+        instrument_rules_snapshot_id: str = "",
     ) -> tuple[int | None, dict[str, Any]]:
         program = compile_strategy_v2(code)
         manifest = program.manifest
@@ -200,6 +205,15 @@ class StrategyV2BacktestService:
             members = self.universe_service.resolve_members(user_id, universe_id, as_of=timestamp.date())
             return [_member_key(item) for item in members]
 
+        rules_snapshot = None
+        if any(str(item.get("market") or "") == "Crypto" for item in candidates):
+            rules_snapshot = self.instrument_rules_provider.historical_snapshot(
+                candidates,
+                snapshot_id=instrument_rules_snapshot_id,
+                as_of=end_date,
+                persist=self.data_kind == "market" and persist,
+            )
+
         runner = StrategyV2BacktestRunner(
             code=code,
             frames=frames,
@@ -211,8 +225,16 @@ class StrategyV2BacktestService:
             commission=commission,
             slippage=slippage,
             universe_resolver=resolve_universe,
+            instrument_rules=rules_snapshot,
         )
         result = runner.run(start_date=start_date, end_date=end_date)
+        result["reviewCandles"] = _build_review_candle_snapshots(
+            frames,
+            result.get("closedTrades") or [],
+            source_frequency=frequency,
+            start_date=start_date,
+            end_date=end_date,
+        )
         benchmark_spec = _benchmark_for_manifest(manifest)
         benchmark_frame = None
         benchmark_error = ""
@@ -220,11 +242,16 @@ class StrategyV2BacktestService:
             benchmark_frame = frames.get(benchmark_spec.key)
             if benchmark_frame is None:
                 try:
+                    benchmark_frequency = _review_frequency_for_window(
+                        frequency,
+                        int((end_date - start_date).total_seconds()),
+                        max_bars=3000,
+                    )[0]
                     benchmark_frame = self.frame_fetcher(
                         benchmark_spec.market,
                         benchmark_spec.symbol,
-                        frequency,
-                        fetch_starts[frequency],
+                        benchmark_frequency,
+                        start_date,
                         end_date,
                         market_type=benchmark_spec.market_type,
                         exchange_id=benchmark_spec.exchange_id,
@@ -292,6 +319,7 @@ class StrategyV2BacktestService:
         result["executionAssumptions"] = {
             "engineVersion": StrategyV2BacktestRunner.VERSION,
             "fillRule": "scheduled_current_open_or_signal_next_open",
+            "preFillValuationRule": StrategyV2BacktestRunner.PREFILL_VALUATION_POLICY,
             "protectionRule": "gap_open_then_intrabar_trigger",
             "intrabarMode": "conservative",
             "barClosePolicy": "closed_bars_only",
@@ -366,9 +394,9 @@ class StrategyV2BacktestService:
         frequency: str,
         start_date: datetime,
         end_date: datetime,
-    ) -> tuple[dict[str, pd.DataFrame], list[dict[str, str]]]:
+    ) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
         frames: dict[str, pd.DataFrame] = {}
-        skipped: list[dict[str, str]] = []
+        skipped: list[dict[str, Any]] = []
 
         def fetch(member: dict[str, Any]):
             frame = self.frame_fetcher(
@@ -384,8 +412,11 @@ class StrategyV2BacktestService:
 
         workers = min(8, max(1, len(candidates)))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="strategy-v2-data") as executor:
-            futures = [executor.submit(fetch, member) for member in candidates]
+            futures = {
+                executor.submit(fetch, member): member for member in candidates
+            }
             for future in as_completed(futures):
+                member = futures[future]
                 try:
                     member, frame = future.result()
                     if frame is None or frame.empty:
@@ -393,7 +424,14 @@ class StrategyV2BacktestService:
                         continue
                     frames[member["key"]] = frame
                 except Exception as exc:
-                    skipped.append({"symbol": "", "reason": str(exc)[:240]})
+                    if isinstance(exc, MarketDataUnavailableError):
+                        skipped.append({
+                            "symbol": member.get("key") or "",
+                            "reason": str(exc),
+                            "market_data_error": exc.failure.as_dict(),
+                        })
+                    else:
+                        skipped.append({"symbol": member.get("key") or "", "reason": str(exc)[:240]})
         return dict(sorted(frames.items())), skipped
 
     def fetch_frequency_frames(
@@ -402,12 +440,12 @@ class StrategyV2BacktestService:
         frequencies: tuple[str, ...],
         start_dates: dict[str, datetime],
         end_date: datetime,
-    ) -> tuple[dict[str, dict[str, pd.DataFrame]], list[dict[str, str]]]:
+    ) -> tuple[dict[str, dict[str, pd.DataFrame]], list[dict[str, Any]]]:
         """Load every declared timeframe and retain only complete symbol bundles."""
         bundles: dict[str, dict[str, pd.DataFrame]] = {
             frequency: {} for frequency in frequencies
         }
-        skipped: list[dict[str, str]] = []
+        skipped: list[dict[str, Any]] = []
 
         def fetch(member: dict[str, Any], frequency: str):
             frame = self.frame_fetcher(
@@ -448,18 +486,23 @@ class StrategyV2BacktestService:
                         continue
                     bundles[frequency][member["key"]] = frame
                 except Exception as exc:
-                    skipped.append({
+                    item: dict[str, Any] = {
                         "symbol": member.get("key") or "",
                         "frequency": frequency,
                         "reason": str(exc)[:240],
-                    })
+                    }
+                    if isinstance(exc, MarketDataUnavailableError):
+                        item["market_data_error"] = exc.failure.as_dict()
+                    skipped.append(item)
 
         complete_symbols = set.intersection(
             *(set(frames) for frames in bundles.values())
         ) if bundles else set()
         for frequency, frames in bundles.items():
             bundles[frequency] = {
-                key: frame for key, frame in frames.items() if key in complete_symbols
+                key: frames[key]
+                for key in sorted(frames)
+                if key in complete_symbols
             }
         return bundles, skipped
 
@@ -524,11 +567,35 @@ def _warmup_calendar_days(frequency: str, warmup_bars: int) -> int:
 def _benchmark_for_manifest(manifest: StrategyManifest) -> InstrumentSpec | None:
     if manifest.benchmark is not None:
         return manifest.benchmark
-    if manifest.strategy_type == "portfolio" or manifest.universe.kind != "static":
-        return InstrumentSpec(market="USStock", symbol="SPY", market_type="spot")
-    if not manifest.universe.instruments:
+
+    instruments: list[InstrumentSpec] = list(manifest.universe.instruments)
+    instrument_keys = {item.key for item in instruments}
+    for subscription in manifest.subscriptions:
+        for instrument in subscription.instruments:
+            if instrument.key not in instrument_keys:
+                instruments.append(instrument)
+                instrument_keys.add(instrument.key)
+
+    if manifest.strategy_type == "portfolio":
+        markets = {item.market for item in instruments}
+        # Only infer a benchmark when the market mapping is unambiguous.  A
+        # silent SPY fallback for crypto, HK or mixed portfolios produces a
+        # plausible-looking but semantically wrong excess-return series.
+        if markets == {"USStock"}:
+            return InstrumentSpec(market="USStock", symbol="SPY", market_type="spot")
+        if markets == {"Crypto"}:
+            first = instruments[0] if instruments else None
+            return InstrumentSpec(
+                market="Crypto",
+                symbol="BTC/USDT",
+                exchange_id=first.exchange_id if first else "",
+                market_type="spot",
+            )
         return None
-    instrument = manifest.universe.instruments[0]
+
+    if not instruments:
+        return None
+    instrument = instruments[0]
     if instrument.market == "Crypto" and instrument.market_type == "swap":
         return InstrumentSpec(
             market="Crypto",
@@ -572,7 +639,25 @@ def _build_benchmark_result(
         errors="coerce",
         utc=True,
     )).tz_convert(None)
-    aligned = close.reindex(close.index.union(timestamps)).sort_index().ffill().reindex(timestamps)
+    coverage_start = pd.Timestamp(close.index.min())
+    last_bar_open = pd.Timestamp(close.index.max())
+    # Market-data indexes represent the *opening* instant of each bar.  Treating
+    # the final open as the coverage boundary incorrectly marks a complete 15m
+    # benchmark as partial when the strategy equity curve contains observations
+    # from the remaining minutes of that same bar.  Extend coverage by exactly
+    # one inferred bar -- never farther -- so stale prices still cannot leak into
+    # later missing periods.
+    unique_index = pd.DatetimeIndex(close.index).drop_duplicates().sort_values()
+    deltas = unique_index.to_series().diff().dropna()
+    positive_deltas = deltas[deltas > pd.Timedelta(0)]
+    bar_interval = positive_deltas.median() if not positive_deltas.empty else pd.Timedelta(0)
+    coverage_end = (
+        last_bar_open + bar_interval - pd.Timedelta(microseconds=1)
+        if bar_interval > pd.Timedelta(0)
+        else last_bar_open
+    )
+    covered_timestamps = timestamps[(timestamps >= coverage_start) & (timestamps <= coverage_end)]
+    aligned = close.reindex(close.index.union(covered_timestamps)).sort_index().ffill().reindex(covered_timestamps)
     aligned = aligned.dropna()
     if aligned.empty or float(aligned.iloc[0]) <= 0:
         return {
@@ -591,12 +676,17 @@ def _build_benchmark_result(
         for timestamp, value in aligned.items()
     ]
     total_return = (float(curve[-1]["value"]) / float(initial_capital) - 1.0) * 100.0
+    coverage_ratio = float(len(aligned)) / float(len(timestamps)) if len(timestamps) else 0.0
+    status = "available" if len(aligned) == len(timestamps) else "partial"
     return {
         "benchmark": metadata,
-        "benchmarkStatus": "available",
-        "benchmarkError": "",
+        "benchmarkStatus": status,
+        "benchmarkError": "" if status == "available" else "strategyV2.benchmarkPartialCoverage",
         "benchmarkCurve": curve,
         "benchmarkTotalReturn": total_return,
+        "benchmarkCoverageStart": coverage_start.tz_localize("UTC").isoformat().replace("+00:00", "Z"),
+        "benchmarkCoverageEnd": coverage_end.tz_localize("UTC").isoformat().replace("+00:00", "Z"),
+        "benchmarkCoverageRatio": coverage_ratio,
     }
 
 
@@ -616,6 +706,154 @@ def _frame_provenance(
         "contentHash": fingerprint,
         **snapshot,
     }
+
+
+_REVIEW_FREQUENCIES: tuple[tuple[str, str, int], ...] = (
+    ("1m", "1min", 60),
+    ("5m", "5min", 300),
+    ("15m", "15min", 900),
+    ("30m", "30min", 1800),
+    ("1H", "1h", 3600),
+    ("4H", "4h", 14400),
+    ("1D", "1D", 86400),
+    ("1W", "1W", 604800),
+)
+
+
+def _build_review_candle_snapshots(
+    frames: dict[str, pd.DataFrame],
+    trades: list[dict[str, Any]],
+    *,
+    source_frequency: str,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    max_bars: int = 1000,
+    max_symbols: int = 12,
+) -> dict[str, dict[str, Any]]:
+    """Persist bounded OHLCV-only snapshots for fast, reproducible trade review."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades or []:
+        symbol = _review_instrument_key((trade or {}).get("symbol"))
+        if symbol and symbol in frames:
+            grouped.setdefault(symbol, []).append(trade)
+    snapshots: dict[str, dict[str, Any]] = {}
+    for symbol in list(grouped)[:max(1, int(max_symbols or 1))]:
+        frame = frames.get(symbol)
+        if frame is None or frame.empty:
+            continue
+        timestamps = [
+            pd.to_datetime(item.get(field), errors="coerce", utc=True)
+            for item in grouped[symbol]
+            for field in ("entry_time", "exit_time")
+        ]
+        timestamps = [item for item in timestamps if not pd.isna(item)]
+        if not timestamps:
+            continue
+        trade_entry = min(timestamps).tz_convert(None)
+        trade_exit = max(timestamps).tz_convert(None)
+        requested_start = (
+            pd.to_datetime(start_date, errors="coerce", utc=True).tz_convert(None)
+            if start_date is not None
+            else pd.NaT
+        )
+        requested_end = (
+            pd.to_datetime(end_date, errors="coerce", utc=True).tz_convert(None)
+            if end_date is not None
+            else pd.NaT
+        )
+        entry = requested_start if not pd.isna(requested_start) else trade_entry
+        exit_at = requested_end if not pd.isna(requested_end) else trade_exit
+        source_seconds = _review_frequency_seconds(source_frequency)
+        span_seconds = max(source_seconds, int((exit_at - entry).total_seconds()))
+        if not pd.isna(requested_start) and not pd.isna(requested_end):
+            window_start = entry
+            window_end = exit_at
+        else:
+            padding_seconds = max(source_seconds * 8, int(span_seconds * 0.05))
+            window_start = entry - pd.Timedelta(seconds=padding_seconds)
+            window_end = exit_at + pd.Timedelta(seconds=padding_seconds)
+        timeframe, rule, _ = _review_frequency_for_window(
+            source_frequency,
+            int((window_end - window_start).total_seconds()),
+            max_bars=max_bars,
+        )
+        candle_frame = _resample_review_frame(frame, rule, window_start, window_end)
+        if candle_frame.empty:
+            continue
+        if len(candle_frame.index) > max_bars:
+            candle_frame = candle_frame.iloc[-max_bars:]
+        snapshots[symbol] = {
+            "timeframe": timeframe,
+            "candles": [
+                {
+                    "time": int(pd.Timestamp(index).tz_localize("UTC").timestamp()),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+                for index, row in candle_frame.iterrows()
+            ],
+        }
+    return snapshots
+
+
+def _review_instrument_key(value: object) -> str:
+    """Map a hedged position key back to the market-data instrument key."""
+    symbol = str(value or "").strip()
+    base, separator, suffix = symbol.rpartition("::")
+    if separator and suffix.strip().lower() in {"long", "short"}:
+        return base
+    return symbol
+
+
+def _review_frequency_seconds(value: str) -> int:
+    normalized = str(value or "").strip().lower()
+    return next((seconds for key, _, seconds in _REVIEW_FREQUENCIES if key.lower() == normalized), 86400)
+
+
+def _review_frequency_for_window(
+    source_frequency: str,
+    span_seconds: int,
+    *,
+    max_bars: int,
+) -> tuple[str, str, int]:
+    source_seconds = _review_frequency_seconds(source_frequency)
+    choices = [item for item in _REVIEW_FREQUENCIES if item[2] >= source_seconds]
+    for item in choices:
+        if span_seconds // item[2] + 2 <= max(1, max_bars):
+            return item
+    return choices[-1] if choices else _REVIEW_FREQUENCIES[-1]
+
+
+def _resample_review_frame(
+    frame: pd.DataFrame,
+    rule: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    columns = {str(column).lower(): column for column in frame.columns}
+    required = {name: columns.get(name) for name in ("open", "high", "low", "close", "volume")}
+    if any(value is None for value in required.values()):
+        return pd.DataFrame()
+    source = frame[[required[name] for name in ("open", "high", "low", "close", "volume")]].copy()
+    source.columns = ["open", "high", "low", "close", "volume"]
+    index = pd.DatetimeIndex(pd.to_datetime(source.index, errors="coerce", utc=True)).tz_convert(None)
+    source.index = index
+    source = source[~source.index.isna()].sort_index()
+    source = source.loc[(source.index >= start) & (source.index <= end)]
+    if source.empty:
+        return source
+    for column in source.columns:
+        source[column] = pd.to_numeric(source[column], errors="coerce")
+    return source.resample(rule, label="right", closed="right").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
 
 
 def _member_key(member: dict[str, Any]) -> str:

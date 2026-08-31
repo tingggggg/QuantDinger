@@ -19,6 +19,11 @@ from app.services.factors import (
     get_factor,
     is_talib_available,
 )
+from app.services.instrument_rules import (
+    InstrumentRules,
+    InstrumentRulesSnapshot,
+    default_rules_for_symbol,
+)
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
 from .data import MultiAssetDataPortal
 from .frequencies import normalize_frequency
@@ -648,11 +653,13 @@ class MultiAssetSimulationBroker:
         leverage: float = 1.0,
         commission: float = 0.0005,
         slippage: float = 0.0005,
+        instrument_rules: InstrumentRulesSnapshot | Mapping[str, InstrumentRules | Mapping[str, Any]] | None = None,
     ) -> None:
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.leverage = max(1.0, float(leverage or 1.0))
         self.commission = max(0.0, float(commission or 0.0))
         self.slippage = max(0.0, float(slippage or 0.0))
+        self.instrument_rules = instrument_rules
         self.executions: list[dict[str, Any]] = []
         self.closed_trades: list[dict[str, Any]] = []
         self._entries: dict[str, dict[str, Any]] = {}
@@ -682,7 +689,12 @@ class MultiAssetSimulationBroker:
         batch_orders = list(orders)
         if not batch_orders:
             return deferred
-        equity_before = self.mark_to_market(portal, timestamp)
+        execution_price_overrides = dict(price_overrides or {})
+        equity_before = self.mark_to_market_before_fill(
+            portal,
+            timestamp,
+            price_overrides=execution_price_overrides,
+        )
         cash_before = float(self.portfolio.available_cash)
         target_weights: dict[str, float] = {}
         batch_event_indexes: list[int] = []
@@ -706,7 +718,11 @@ class MultiAssetSimulationBroker:
                 order.symbol,
                 position_side=_normalize_position_side(order.position_side),
             )
-            equity = self.mark_to_market(portal, timestamp)
+            # Every target in one execution batch is sized from the same
+            # pre-fill snapshot. The snapshot contains only prices observable
+            # at the declared fill instant, never the current bar's later
+            # close/high/low values.
+            equity = equity_before
             is_limit_order = order.order_type == "limit" or order.execution_algo == "limit"
             sizing_price = (
                 float(order.limit_price)
@@ -727,6 +743,9 @@ class MultiAssetSimulationBroker:
                 order.kind in {"target_quantity", "target_value", "target_percent"}
                 and abs(target_qty) <= 1e-12
                 and abs(current.amount) > 1e-12
+            )
+            reconciles_swap_remainder = (
+                closes_position and self._is_crypto_swap_symbol(order.symbol)
             )
             if abs(delta) <= 1e-12 or (abs(delta * sizing_price) < 0.01 and not closes_position):
                 batch_event_indexes.append(self._append_order_event(self._order_event(
@@ -780,9 +799,17 @@ class MultiAssetSimulationBroker:
                     1.0 + self.slippage if delta > 0 else 1.0 - self.slippage
                 )
             requested_delta = delta
-            lot_size = self._lot_size(order.symbol, bar)
+            rules = self._rules_for(order.symbol)
+            lot_size = self._lot_size(order.symbol, rules)
             delta = self._round_to_lot(delta, lot_size)
-            if abs(delta) < lot_size - 1e-12:
+            exact_close_remainder = False
+            if reconciles_swap_remainder and abs(delta) < lot_size - 1e-12:
+                # A simulated position may contain a sub-lot numerical residue.
+                # A target-zero order reconciles that residue exactly instead of
+                # leaving an uncloseable position or silently writing it off.
+                delta = -current.amount
+                exact_close_remainder = True
+            if abs(delta) < lot_size - 1e-12 and not exact_close_remainder:
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "minimum_trade_unit",
                     requested_quantity=abs(requested_delta),
@@ -791,7 +818,12 @@ class MultiAssetSimulationBroker:
             liquidity_cap = None if forced_liquidation else self._liquidity_cap(bar, lot_size)
             if liquidity_cap is not None and abs(delta) > liquidity_cap:
                 delta = math.copysign(liquidity_cap, delta)
-            if forced_liquidation:
+            if reconciles_swap_remainder and current.amount * delta < 0:
+                residual = current.amount + delta
+                if 0 < abs(residual) < lot_size - 1e-12:
+                    delta = -current.amount
+                    exact_close_remainder = True
+            if forced_liquidation or exact_close_remainder:
                 feasible_delta, constraint_reason = delta, ""
             else:
                 feasible_delta, constraint_reason = self._feasible_delta(
@@ -802,7 +834,7 @@ class MultiAssetSimulationBroker:
                     lot_size=lot_size,
                     position_key=position_key,
                 )
-            if abs(feasible_delta) < lot_size - 1e-12:
+            if abs(feasible_delta) < lot_size - 1e-12 and not exact_close_remainder:
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id,
                     order,
@@ -813,6 +845,35 @@ class MultiAssetSimulationBroker:
                 )))
                 continue
             delta = feasible_delta
+            min_amount = max(0.0, float(rules.min_amount or 0.0))
+            min_notional = max(0.0, float(rules.min_notional or 0.0))
+            pure_reduction = self._is_pure_reduction(current.amount, delta)
+            swap_reduction = (
+                pure_reduction and self._is_crypto_swap_symbol(order.symbol)
+            )
+            if (
+                min_amount > 0
+                and abs(delta) + 1e-12 < min_amount
+                and not forced_liquidation
+                and not swap_reduction
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "minimum_trade_unit",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
+            if (
+                min_notional > 0
+                and fill_price > 0
+                and not forced_liquidation
+                and not swap_reduction
+                and abs(delta * fill_price) < min_notional
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "min_notional",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
             target_qty = current.amount + delta
             remaining_quantity = max(0.0, abs(requested_delta) - abs(delta))
             has_tradable_remainder = (
@@ -828,8 +889,10 @@ class MultiAssetSimulationBroker:
             current.amount = target_qty
             current.avg_cost = _next_average_cost(old_amount, current.avg_cost, delta, fill_price)
             current.last_price = fill_price
+            execution_price_overrides[order.symbol] = fill_price
             self.portfolio.available_cash = projected_cash
             if abs(current.amount) <= 1e-12:
+                current.amount = 0.0
                 self.portfolio.positions.pop(position_key, None)
                 self._protections.pop(position_key, None)
             else:
@@ -945,6 +1008,7 @@ class MultiAssetSimulationBroker:
             cash_before=cash_before,
             target_weights=target_weights,
             event_indexes=batch_event_indexes,
+            price_overrides=execution_price_overrides,
         )
         return deferred
 
@@ -1057,17 +1121,45 @@ class MultiAssetSimulationBroker:
         return self._round_to_lot(feasible, lot_size), reason
 
     @staticmethod
-    def _lot_size(symbol: str, bar: Mapping[str, Any] | None) -> float:
-        explicit = float((bar or {}).get("lot_size") or 0.0)
+    def _lot_size(symbol: str, rules: InstrumentRules) -> float:
+        explicit = float(rules.amount_step or 0.0)
         if explicit > 0:
             return explicit
         return 1e-8 if str(symbol).startswith("Crypto:") else 1.0
+
+    def _rules_for(self, symbol: str) -> InstrumentRules:
+        source = self.instrument_rules
+        item: InstrumentRules | Mapping[str, Any] | None = None
+        if isinstance(source, InstrumentRulesSnapshot):
+            item = source.get(symbol)
+        elif isinstance(source, Mapping):
+            item = source.get(symbol)
+        if isinstance(item, InstrumentRules):
+            return item
+        if isinstance(item, Mapping):
+            return InstrumentRules.from_mapping(item)
+        return default_rules_for_symbol(symbol)
+
+    @staticmethod
+    def _is_pure_reduction(current_amount: float, delta: float) -> bool:
+        return (
+            current_amount * delta < 0
+            and abs(delta) <= abs(current_amount) + 1e-12
+        )
+
+    @staticmethod
+    def _is_crypto_swap_symbol(symbol: str) -> bool:
+        text = str(symbol or "").strip().lower()
+        if not text.startswith("crypto:") or "@" not in text:
+            return False
+        binding = text.rsplit("@", 1)[-1]
+        return binding == "swap" or binding.endswith(":swap")
 
     @staticmethod
     def _round_to_lot(value: float, lot_size: float) -> float:
         if lot_size <= 0:
             return value
-        units = math.floor(abs(value) / lot_size + 1e-8)
+        units = math.floor(abs(value) / lot_size + 1e-12)
         return math.copysign(units * lot_size, value) if units else 0.0
 
     @staticmethod
@@ -1178,8 +1270,13 @@ class MultiAssetSimulationBroker:
         cash_before: float,
         target_weights: Mapping[str, float],
         event_indexes: list[int],
+        price_overrides: Mapping[str, float] | None = None,
     ) -> None:
-        equity_after = self.mark_to_market(portal, timestamp)
+        equity_after = self.mark_to_market_before_fill(
+            portal,
+            timestamp,
+            price_overrides=price_overrides,
+        )
         actual_weights = {
             symbol: position.market_value / equity_after if equity_after else 0.0
             for symbol, position in self.portfolio.positions.items()
@@ -1261,6 +1358,40 @@ class MultiAssetSimulationBroker:
             price = portal.close_at(symbol, timestamp)
             if price is None:
                 price = portal.current(symbol, "close", position.last_price)
+            position.last_price = float(price or position.last_price or position.avg_cost)
+            total += position.market_value
+        self.portfolio.total_value = total
+        return total
+
+    def mark_to_market_before_fill(
+        self,
+        portal: MultiAssetDataPortal,
+        timestamp: Any,
+        *,
+        price_overrides: Mapping[str, float] | None = None,
+    ) -> float:
+        """Value positions using only information available at the fill instant.
+
+        Market orders execute at the current bar open, so a position with a
+        bar at ``timestamp`` is marked at that open. Sparse instruments fall
+        back to their last completed close through the portal's point-in-time
+        visibility gate. Explicit execution prices cover intrabar protection
+        fills and forced liquidations without exposing the bar close.
+        """
+        total = float(self.portfolio.available_cash)
+        overrides = price_overrides or {}
+        for position_key, position in self.portfolio.positions.items():
+            raw_price = overrides.get(position_key)
+            if raw_price is None:
+                raw_price = overrides.get(position.symbol)
+            try:
+                price = float(raw_price) if raw_price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            if price is None or not math.isfinite(price) or price <= 0:
+                price = portal.open_at(position.symbol, timestamp)
+            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+                price = portal.current(position.symbol, "close", position.last_price)
             position.last_price = float(price or position.last_price or position.avg_cost)
             total += position.market_value
         self.portfolio.total_value = total
@@ -1500,6 +1631,7 @@ class MultiAssetSimulationBroker:
 
 class StrategyV2BacktestRunner:
     VERSION = "quantdinger-strategy-api-v2"
+    PREFILL_VALUATION_POLICY = "explicit_fill_or_current_open_then_last_completed_close-v1"
 
     def __init__(
         self,
@@ -1514,6 +1646,7 @@ class StrategyV2BacktestRunner:
         commission: float = 0.0005,
         slippage: float = 0.0005,
         universe_resolver=None,
+        instrument_rules: InstrumentRulesSnapshot | Mapping[str, InstrumentRules | Mapping[str, Any]] | None = None,
     ) -> None:
         self.program: CompiledStrategyV2 = compile_strategy_v2(code)
         requested_leverage = max(1.0, float(leverage or 1.0)) if leverage_enabled else 1.0
@@ -1532,7 +1665,9 @@ class StrategyV2BacktestRunner:
             leverage=requested_leverage,
             commission=commission,
             slippage=slippage,
+            instrument_rules=instrument_rules,
         )
+        self.instrument_rules = instrument_rules
         runtime_params = dict(params or {})
         runtime_params.setdefault("commission", self.broker.commission)
         runtime_params.setdefault("slippage", self.broker.slippage)
@@ -1833,8 +1968,14 @@ class StrategyV2BacktestRunner:
             max(1, int(item.get("occurrenceCount") or 1))
             for item in self.broker.order_ledger
         )
+        rules_snapshot = (
+            self.instrument_rules.metadata()
+            if isinstance(self.instrument_rules, InstrumentRulesSnapshot)
+            else None
+        )
         return {
             "initialCapital": initial,
+            "instrumentRulesSnapshot": rules_snapshot,
             "totalReturn": total_return,
             "total_return": total_return,
             "finalEquity": final,
@@ -1907,7 +2048,10 @@ class StrategyV2BacktestRunner:
             "attribution": attribution,
             "logs": list(self.logs),
             "manifest": self.program.manifest.metadata(),
-            "engine": {"version": self.VERSION},
+            "engine": {
+                "version": self.VERSION,
+                "preFillValuationPolicy": self.PREFILL_VALUATION_POLICY,
+            },
             "audit": self._reconcile(),
         }
 

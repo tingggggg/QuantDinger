@@ -12,12 +12,17 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import pandas as pd
 
 from app.data_sources import DataSourceFactory
+from app.data_sources.errors import (
+    MarketDataUnavailableError,
+    classify_market_data_failure,
+)
 from app.services.script_source import get_script_source_service
 from app.services.strategy_runtime.health import record_runtime_heartbeat
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
 from app.services.strategy_runtime.order_intents import OrderIntentService
 from app.services.strategy_runtime.state import RuntimeStateStore
 from app.services.strategy_runtime.timeframes import (
+    completed_bar_token,
     live_history_days,
     load_live_frequency_frames,
 )
@@ -31,7 +36,7 @@ from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.numeric_precision import format_decimal
-from app.utils.strategy_runtime_logs import append_strategy_log
+from app.utils.strategy_runtime_logs import append_strategy_log, format_market_data_log
 from app.utils.thread_capacity import format_thread_capacity
 
 
@@ -320,6 +325,7 @@ class TradingExecutor:
         run_id = 0
         exit_reason = "strategy stopped"
         market_price_feed = None
+        state_store: RuntimeStateStore | None = None
         try:
             strategy = self._load_strategy(strategy_id)
             if not strategy:
@@ -505,13 +511,29 @@ class TradingExecutor:
 
             signal_poll = max(1.0, min(30.0, float(trading_config.get("data_poll_seconds") or 5)))
             risk_tick = max(0.25, min(5.0, float(trading_config.get("risk_tick_seconds") or 1)))
+            try:
+                configured_state_write_interval = float(
+                    trading_config.get("state_write_interval_seconds")
+                    or os.getenv("STRATEGY_STATE_WRITE_INTERVAL_SEC", "5")
+                )
+            except (TypeError, ValueError):
+                configured_state_write_interval = 5.0
+            state_write_interval = max(
+                1.0,
+                min(60.0, configured_state_write_interval),
+            )
             price_stale_after = max(
                 risk_tick * 3.0,
                 min(30.0, float(trading_config.get("price_stale_after_seconds") or 10.0)),
             )
             next_signal_poll = 0.0
+            last_signal_bar_token: int | None = None
+            last_processed_frame_timestamp: pd.Timestamp | None = None
+            initial_frames_pending = True
             stale_price_logged = False
             consecutive_errors = 0
+            last_market_data_failure_key = ""
+            last_market_data_log_at = 0.0
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
             leverage = max(1.0, float(trading_config.get("leverage") or strategy.get("leverage") or 1))
@@ -693,49 +715,78 @@ class TradingExecutor:
                     # driven through ``session.process(frames)`` below.
                     pending_count = len(equity_intents) + len(protection_intents)
                     if not equity_stop_reason and cycle_started >= next_signal_poll:
-                        frequency_frames = fetch_runtime_frames()
-                        frames = frequency_frames[frequency]
-                        intents, messages, timestamp = session.process(
-                            frames,
-                            frequency_frames=frequency_frames,
+                        current_bar_token = completed_bar_token(frequency)
+                        has_new_closed_bar = (
+                            initial_frames_pending
+                            or current_bar_token != last_signal_bar_token
                         )
-                        intents = [
-                            intent
-                            for intent in intents
-                            if _runtime_position_key(
-                                intent.symbol,
-                                intent.position_side,
-                            ) not in protected
-                        ]
-                        pending_count += len(intents)
-                        for message in messages:
-                            append_strategy_log(strategy_id, "info", message)
-                        for intent in intents:
-                            submitted = self._execute_strategy_v2_intent(
-                                strategy_id=strategy_id,
-                                strategy_name=strategy_name,
-                                intent=intent,
-                                frames=frames,
-                                candidates=candidates,
-                                initial_capital=initial_capital,
-                                leverage=leverage,
-                                execution_mode=execution_mode,
-                                notification_config=notification_config,
-                                trading_config=trading_config,
-                                exchange_config=exchange_config,
-                                signal_ts=self._intent_signal_timestamp(intent, timestamp),
-                                strategy_run_id=run_id,
-                                direction_mode=direction_mode,
+                        if has_new_closed_bar:
+                            # Startup already warmed the complete frame bundle.
+                            # Every later trigger extends the shared cache only
+                            # for the newly completed candle window.
+                            if not initial_frames_pending:
+                                frequency_frames = fetch_runtime_frames()
+                                frames = frequency_frames[frequency]
+                            latest_frame_timestamp = _latest_frame_timestamp(frames)
+                            frame_advanced = bool(
+                                initial_frames_pending
+                                or last_processed_frame_timestamp is None
+                                or (
+                                    latest_frame_timestamp is not None
+                                    and latest_frame_timestamp
+                                    > last_processed_frame_timestamp
+                                )
                             )
-                            if intent.client_order_id:
-                                session.context.update_order_statuses({
-                                    intent.client_order_id: {
-                                        "client_order_id": intent.client_order_id,
-                                        "status": "submitted" if submitted else "rejected",
-                                    },
-                                })
+                            if frame_advanced:
+                                intents, messages, timestamp = session.process(
+                                    frames,
+                                    frequency_frames=frequency_frames,
+                                )
+                                intents = [
+                                    intent
+                                    for intent in intents
+                                    if _runtime_position_key(
+                                        intent.symbol,
+                                        intent.position_side,
+                                    ) not in protected
+                                ]
+                                pending_count += len(intents)
+                                for message in messages:
+                                    append_strategy_log(strategy_id, "info", message)
+                                for intent in intents:
+                                    submitted = self._execute_strategy_v2_intent(
+                                        strategy_id=strategy_id,
+                                        strategy_name=strategy_name,
+                                        intent=intent,
+                                        frames=frames,
+                                        candidates=candidates,
+                                        initial_capital=initial_capital,
+                                        leverage=leverage,
+                                        execution_mode=execution_mode,
+                                        notification_config=notification_config,
+                                        trading_config=trading_config,
+                                        exchange_config=exchange_config,
+                                        signal_ts=self._intent_signal_timestamp(intent, timestamp),
+                                        strategy_run_id=run_id,
+                                        direction_mode=direction_mode,
+                                    )
+                                    if intent.client_order_id:
+                                        session.context.update_order_statuses({
+                                            intent.client_order_id: {
+                                                "client_order_id": intent.client_order_id,
+                                                "status": (
+                                                    "submitted" if submitted else "rejected"
+                                                ),
+                                            },
+                                        })
+                                initial_frames_pending = False
+                                last_signal_bar_token = current_bar_token
+                                last_processed_frame_timestamp = latest_frame_timestamp
                         next_signal_poll = cycle_started + signal_poll
-                    state_store.save(session.session_snapshot())
+                    state_store.save(
+                        session.session_snapshot(),
+                        min_interval_seconds=state_write_interval,
+                    )
                     self._heartbeat(
                         strategy_id,
                         run_id,
@@ -761,18 +812,43 @@ class TradingExecutor:
                         self._mark_stopped(strategy_id)
                         break
                     consecutive_errors = 0
+                    if last_market_data_failure_key:
+                        append_strategy_log(strategy_id, "info", "Market data feed recovered")
+                        last_market_data_failure_key = ""
+                        last_market_data_log_at = 0.0
                 except Exception as exc:
-                    if str(exc) == "strategyV2.noMarketData":
+                    if isinstance(exc, MarketDataUnavailableError) or str(exc) == "strategyV2.noMarketData":
                         next_signal_poll = cycle_started + signal_poll
+                        failure = (
+                            exc.failure
+                            if isinstance(exc, MarketDataUnavailableError)
+                            else classify_market_data_failure("No usable market data")
+                        )
+                        failure_key = "|".join((
+                            failure.code,
+                            failure.exchange_id,
+                            failure.market_type,
+                            failure.symbol,
+                            failure.timeframe,
+                            failure.technical_detail,
+                        ))
                         logger.warning(
-                            "Strategy %s temporarily has no usable market data",
+                            "Strategy %s market data unavailable (%s): %s",
                             strategy_id,
+                            failure.code,
+                            failure.technical_detail or failure.message,
                         )
-                        append_strategy_log(
-                            strategy_id,
-                            "warning",
-                            "Runtime cycle skipped because no instrument has usable market data",
-                        )
+                        if (
+                            failure_key != last_market_data_failure_key
+                            or cycle_started - last_market_data_log_at >= 60.0
+                        ):
+                            append_strategy_log(
+                                strategy_id,
+                                "warning",
+                                format_market_data_log(failure),
+                            )
+                            last_market_data_failure_key = failure_key
+                            last_market_data_log_at = cycle_started
                         self._heartbeat(
                             strategy_id,
                             run_id,
@@ -781,7 +857,7 @@ class TradingExecutor:
                             0,
                             loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
                             status="degraded",
-                            last_error=str(exc),
+                            last_error=f"marketData.{failure.code}",
                         )
                         continue
                     consecutive_errors += 1
@@ -806,9 +882,14 @@ class TradingExecutor:
             exit_reason = str(exc)
             self._last_exit_reason[strategy_id] = exit_reason
             logger.exception("Strategy %s stopped after runtime failure", strategy_id)
-            append_strategy_log(strategy_id, "error", exit_reason)
+            if isinstance(exc, MarketDataUnavailableError):
+                append_strategy_log(strategy_id, "error", format_market_data_log(exc.failure))
+            else:
+                append_strategy_log(strategy_id, "error", exit_reason)
             self._mark_stopped(strategy_id)
         finally:
+            if state_store is not None:
+                state_store.flush()
             if market_price_feed is not None:
                 market_price_feed.stop()
             if run_id > 0:
@@ -1803,19 +1884,37 @@ class TradingExecutor:
     @staticmethod
     def _live_prices(candidates: list[dict[str, Any]]) -> dict[str, float]:
         prices: dict[str, float] = {}
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for member in candidates:
+            identity = (
+                str(member.get("market") or ""),
+                str(member.get("exchange_id") or ""),
+                str(member.get("market_type") or ""),
+            )
+            groups.setdefault(identity, []).append(member)
+        for (market, exchange_id, market_type), members in groups.items():
             try:
-                ticker = DataSourceFactory.get_ticker(
-                    str(member.get("market") or ""),
-                    str(member.get("symbol") or ""),
-                    exchange_id=str(member.get("exchange_id") or "") or None,
-                    market_type=str(member.get("market_type") or "") or None,
+                symbols = [str(member.get("symbol") or "") for member in members]
+                quotes = DataSourceFactory.get_tickers(
+                    market,
+                    symbols,
+                    exchange_id=exchange_id or None,
+                    market_type=market_type or None,
                 )
-                price = float((ticker or {}).get("last") or (ticker or {}).get("close") or 0)
-                if price > 0:
-                    prices[str(member.get("key") or "")] = price
+                for member in members:
+                    symbol = str(member.get("symbol") or "")
+                    ticker = quotes.get(symbol) or quotes.get(symbol.upper()) or {}
+                    price = float(ticker.get("last") or ticker.get("close") or 0)
+                    if price > 0:
+                        prices[str(member.get("key") or "")] = price
             except Exception as exc:
-                logger.warning("Price fetch failed for %s: %s", member.get("key"), exc)
+                logger.warning(
+                    "Batch price fetch failed for %s/%s (%s symbol(s)): %s",
+                    market,
+                    exchange_id or "default",
+                    len(members),
+                    exc,
+                )
         return prices
 
     @classmethod
@@ -1922,3 +2021,34 @@ def _member_key(member: dict[str, Any]) -> str:
     elif market_type:
         suffix = f"@{market_type}"
     return f"{market}:{symbol}{suffix}"
+
+
+def _latest_frame_timestamp(
+    frames: pd.DataFrame | dict[str, pd.DataFrame] | None,
+) -> pd.Timestamp | None:
+    """Return the newest candle timestamp in a frame or instrument panel.
+
+    Live Strategy V2 sessions pass the driving-frequency panel as a mapping of
+    instrument keys to data frames.  Accepting a single frame as well keeps the
+    helper useful for focused callers and tests without confusing the panel
+    itself with a pandas object.
+    """
+    candidates = frames.values() if isinstance(frames, dict) else (frames,)
+    latest: pd.Timestamp | None = None
+    for frame in candidates:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+        try:
+            timestamp = pd.Timestamp(frame.index[-1])
+            if pd.isna(timestamp):
+                continue
+            timestamp = (
+                timestamp.tz_localize("UTC")
+                if timestamp.tzinfo is None
+                else timestamp.tz_convert("UTC")
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+        if latest is None or timestamp > latest:
+            latest = timestamp
+    return latest
